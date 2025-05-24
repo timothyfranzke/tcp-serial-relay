@@ -27,11 +27,14 @@ class Logger {
         }),
         winston.format.errors({ stack: true }),
         winston.format.printf(({ timestamp, level, message, stack, ...meta }) => {
+          // Ensure level is a string and handle potential undefined/null values
+          const levelStr = (level || 'info').toString().toUpperCase();
           const metaStr = Object.keys(meta).length ? ` ${JSON.stringify(meta)}` : '';
+          
           if (stack) {
-            return `${timestamp} [${level.toUpperCase()}]: ${message}\n${stack}${metaStr}`;
+            return `${timestamp} [${levelStr}]: ${message}\n${stack}${metaStr}`;
           }
-          return `${timestamp} [${level.toUpperCase()}]: ${message}${metaStr}`;
+          return `${timestamp} [${levelStr}]: ${message}${metaStr}`;
         })
       ),
       transports: this.createTransports(),
@@ -74,9 +77,10 @@ class Logger {
           level: 'debug',
           format: winston.format.combine(
             winston.format.colorize(),
-            winston.format.printf(({ timestamp, level, message }) => 
-              `${timestamp} ${level}: ${message}`
-            )
+            winston.format.printf(({ timestamp, level, message }) => {
+              const levelStr = (level || 'info').toString();
+              return `${timestamp} ${levelStr}: ${message}`;
+            })
           )
         })
       );
