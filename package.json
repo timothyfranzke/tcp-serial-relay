@@ -3,6 +3,9 @@
   "version": "1.1.0",
   "description": "Modular TCP to Serial relay service with comprehensive logging, monitoring and web dashboard",
   "main": "src/app.js",
+  "bin": {
+    "tcp-serial-relay": "./bin/tcp-serial-relay.js"
+  },
   "scripts": {
     "start": "node src/app.js",
     "start:legacy": "node job.js",
@@ -62,12 +65,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yourusername/tcp-serial-relay.git"
+    "url": "git+https://github.com/timothyfranzke/tcp-serial-relay.git"
   },
   "bugs": {
-    "url": "https://github.com/yourusername/tcp-serial-relay/issues"
+    "url": "https://github.com/timothyfranzke/tcp-serial-relay/issues"
   },
-  "homepage": "https://github.com/yourusername/tcp-serial-relay#readme",
+  "homepage": "https://github.com/timothyfranzke/tcp-serial-relay#readme",
   "jest": {
     "testEnvironment": "node",
     "collectCoverageFrom": [
