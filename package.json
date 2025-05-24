@@ -1,0 +1,84 @@
+{
+  "name": "tcp-serial-relay",
+  "version": "1.1.0",
+  "description": "Modular TCP to Serial relay service with comprehensive logging, monitoring and web dashboard",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "start:legacy": "node job.js",
+    "start:dev": "NODE_ENV=development LOG_LEVEL=debug node src/app.js",
+    "start:mock": "MOCK_ENV=true LOG_LEVEL=debug node src/app.js",
+    "start:production": "NODE_ENV=production LOG_LEVEL=info node src/app.js",
+    "start:dashboard": "MODE=dashboard-only DASHBOARD_PORT=3000 node src/app.js",
+    "start:dashboard-dev": "MODE=dashboard-only NODE_ENV=development LOG_LEVEL=debug DASHBOARD_PORT=3000 node src/app.js",
+    "start:relay-only": "MODE=relay-only node src/app.js",
+    "start:with-dashboard": "MODE=normal DASHBOARD_PORT=3000 node src/app.js",
+    "dashboard": "npm run start:dashboard",
+    "test": "npm run test:unit && npm run test:integration",
+    "test:unit": "jest tests/unit",
+    "test:integration": "jest tests/integration",
+    "test:watch": "jest --watch",
+    "lint": "eslint src/ tests/",
+    "lint:fix": "eslint src/ tests/ --fix",
+    "health-check": "node scripts/health-check.js",
+    "list-ports": "node -e \"require('./src/services/serial-client').listPorts().then(console.log).catch(console.error)\"",
+    "clean-logs": "rm -rf logs/*",
+    "docs": "jsdoc -d docs src/",
+    "dev": "concurrently \"npm run start:dashboard-dev\" \"npm run start:mock\"",
+    "build:dashboard": "node scripts/build-dashboard.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "serialport": "^12.0.0",
+    "winston": "^3.11.0",
+    "winston-daily-rotate-file": "^4.7.1"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "eslint": "^8.57.0",
+    "eslint-config-standard": "^17.1.0",
+    "jest": "^29.7.0",
+    "jsdoc": "^4.0.2",
+    "supertest": "^6.3.3"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "keywords": [
+    "tcp",
+    "serial",
+    "relay",
+    "logging",
+    "winston",
+    "modular",
+    "monitoring",
+    "industrial",
+    "automation",
+    "dashboard",
+    "web-ui",
+    "real-time"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yourusername/tcp-serial-relay.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/tcp-serial-relay/issues"
+  },
+  "homepage": "https://github.com/yourusername/tcp-serial-relay#readme",
+  "jest": {
+    "testEnvironment": "node",
+    "collectCoverageFrom": [
+      "src/**/*.js",
+      "!src/types/*.js"
+    ],
+    "coverageDirectory": "coverage",
+    "coverageReporters": [
+      "text",
+      "lcov",
+      "html"
+    ]
+  }
+}
