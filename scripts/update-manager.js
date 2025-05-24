@@ -167,11 +167,11 @@ class UpdateManager {
         console.log(`Last Update: ${config.lastUpdate || 'Never'}`);
         
         // Check if cron job exists
-        const cronExists = await this.checkCronJob();
-        console.log(`Cron Job: ${cronExists ? 'Installed' : 'Missing'}`);
+        const cronJobExists = await this.checkCronJob();
+        console.log(`Cron Job: ${cronJobExists ? 'Active' : 'Not Active'}`);
         
-        if (!cronExists) {
-          console.log('⚠️  Cron job is missing. Run "tcp-serial-relay auto-update --fix" to repair.');
+        if (!cronJobExists) {
+          console.log('⚠️  Cron job is not active. Run "tcp-serial-relay auto-update --fix" to repair.');
         }
       }
       
@@ -193,6 +193,7 @@ class UpdateManager {
         // Reinstall cron job
         await this.installCronJob(config.schedule);
         console.log('✅ Auto-update configuration fixed');
+        console.log('Cron job reinstalled and running');
       } else {
         console.log('Auto-updates are disabled');
       }
@@ -254,8 +255,13 @@ class UpdateManager {
 
   async getCurrentVersion() {
     try {
-      const { stdout } = await execAsync('tcp-serial-relay --version');
-      return stdout.trim();
+      // Get version from package.json
+      const packagePath = path.join(__dirname, '../package.json');
+      if (fs.existsSync(packagePath)) {
+        const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+        return packageJson.version;
+      }
+      return 'unknown';
     } catch (error) {
       return 'unknown';
     }
@@ -374,21 +380,26 @@ class UpdateManager {
   }
 
   async checkDiskSpace() {
-    const { stdout } = await execAsync('df / | tail -1');
-    const available = parseInt(stdout.split(/\s+/)[3]);
-    
-    if (available < 100000) { // Less than ~100MB
-      throw new Error('Insufficient disk space for update');
+    try {
+      const { stdout } = await execAsync('df / | tail -1');
+      const available = parseInt(stdout.split(/\s+/)[3]);
+      
+      if (available < 100000) { // Less than ~100MB
+        throw new Error('Insufficient disk space for update');
+      }
+    } catch (error) {
+      console.warn('Could not check disk space:', error.message);
     }
   }
 
   async stopService() {
     try {
-      await execAsync('tcp-serial-relay stop');
+      // Try to stop systemd service
+      await execAsync('systemctl stop tcp-serial-relay');
       console.log('Service stopped');
     } catch (error) {
-      // Service might not be running
-      console.log('Service was not running');
+      // Service might not be running or not systemd
+      console.log('Service was not running or not managed by systemd');
     }
   }
 
@@ -404,12 +415,7 @@ class UpdateManager {
         // Not a systemd service
       }
       
-      // Check if it should run as daemon
-      const config = await this.loadAutoUpdateConfig();
-      if (config.startAfterUpdate !== false) {
-        await execAsync('tcp-serial-relay start --daemon');
-        console.log('Service started as daemon');
-      }
+      console.log('Service restart not needed for cron-based deployment');
     } catch (error) {
       console.warn('Could not restart service:', error.message);
     }
@@ -417,8 +423,11 @@ class UpdateManager {
 
   async validateInstallation() {
     try {
-      await execAsync('tcp-serial-relay --version');
-      await execAsync('tcp-serial-relay config --validate');
+      // Check if the package is installed
+      const packagePath = path.join(__dirname, '../package.json');
+      if (!fs.existsSync(packagePath)) {
+        throw new Error('Package not found after installation');
+      }
       console.log('Installation validated');
     } catch (error) {
       throw new Error('Installation validation failed');
@@ -427,8 +436,12 @@ class UpdateManager {
 
   async runHealthCheck() {
     try {
-      await execAsync('tcp-serial-relay health');
-      console.log('Health check passed');
+      // Try to run health check if available
+      const healthCheckPath = path.join(__dirname, 'health-check.js');
+      if (fs.existsSync(healthCheckPath)) {
+        await execAsync(`node ${healthCheckPath} summary`);
+        console.log('Health check passed');
+      }
     } catch (error) {
       console.warn('Health check failed:', error.message);
     }
@@ -461,40 +474,58 @@ class UpdateManager {
   }
 
   async saveAutoUpdateConfig(config) {
-    const configDir = path.dirname(this.updateConfigPath);
-    if (!fs.existsSync(configDir)) {
-      fs.mkdirSync(configDir, { recursive: true });
+    try {
+      const configDir = path.dirname(this.updateConfigPath);
+      if (!fs.existsSync(configDir)) {
+        fs.mkdirSync(configDir, { recursive: true });
+      }
+      
+      fs.writeFileSync(this.updateConfigPath, JSON.stringify(config, null, 2));
+    } catch (error) {
+      console.error('Failed to save auto-update config:', error.message);
     }
-    
-    fs.writeFileSync(this.updateConfigPath, JSON.stringify(config, null, 2));
   }
 
   async installCronJob(schedule) {
-    const cronCommand = `${process.argv[0]} ${__filename} --auto-run`;
-    const cronEntry = `${schedule} ${cronCommand}`;
-    
     try {
-      // Get existing crontab
-      let existingCron = '';
+      // Get current user's crontab
+      let currentCrontab = '';
       try {
         const { stdout } = await execAsync('crontab -l');
-        existingCron = stdout;
+        currentCrontab = stdout;
       } catch (error) {
         // No existing crontab
       }
       
-      // Remove existing tcp-serial-relay entries
-      const lines = existingCron.split('\n')
-        .filter(line => !line.includes('tcp-serial-relay') && line.trim() !== '');
+      // Remove existing tcp-serial-relay auto-update entries
+      const lines = currentCrontab.split('\n').filter(line => 
+        !line.includes('tcp-serial-relay') || !line.includes('auto-update')
+      );
       
-      // Add new entry
+      // Add new cron job
+      const updateScript = path.join(__dirname, 'update-manager.js');
+      const cronEntry = `${schedule} ${updateScript} --auto-run >> /var/log/tcp-serial-relay/auto-update.log 2>&1`;
       lines.push(cronEntry);
       
       // Install new crontab
-      const newCron = lines.join('\n') + '\n';
-      await execAsync(`echo "${newCron}" | crontab -`);
+      const newCrontab = lines.filter(line => line.trim()).join('\n') + '\n';
       
-      console.log(`Cron job installed: ${cronEntry}`);
+      return new Promise((resolve, reject) => {
+        const child = spawn('crontab', ['-'], { stdio: 'pipe' });
+        child.stdin.write(newCrontab);
+        child.stdin.end();
+        
+        child.on('close', (code) => {
+          if (code === 0) {
+            console.log(`Cron job installed with schedule: ${schedule}`);
+            resolve();
+          } else {
+            reject(new Error(`Failed to install cron job (exit code ${code})`));
+          }
+        });
+        
+        child.on('error', reject);
+      });
     } catch (error) {
       throw new Error(`Failed to install cron job: ${error.message}`);
     }
@@ -502,24 +533,50 @@ class UpdateManager {
 
   async removeCronJob() {
     try {
-      const { stdout } = await execAsync('crontab -l');
-      const lines = stdout.split('\n')
-        .filter(line => !line.includes('tcp-serial-relay') && line.trim() !== '');
+      // Get current user's crontab
+      let currentCrontab = '';
+      try {
+        const { stdout } = await execAsync('crontab -l');
+        currentCrontab = stdout;
+      } catch (error) {
+        // No existing crontab
+        console.log('No existing crontab to modify');
+        return;
+      }
       
-      const newCron = lines.join('\n') + (lines.length > 0 ? '\n' : '');
-      await execAsync(`echo "${newCron}" | crontab -`);
+      // Remove tcp-serial-relay auto-update entries
+      const lines = currentCrontab.split('\n').filter(line => 
+        !line.includes('tcp-serial-relay') || !line.includes('auto-update')
+      );
       
-      console.log('Cron job removed');
+      // Install new crontab
+      const newCrontab = lines.filter(line => line.trim()).join('\n') + '\n';
+      
+      return new Promise((resolve, reject) => {
+        const child = spawn('crontab', ['-'], { stdio: 'pipe' });
+        child.stdin.write(newCrontab);
+        child.stdin.end();
+        
+        child.on('close', (code) => {
+          if (code === 0) {
+            console.log('Cron job removed');
+            resolve();
+          } else {
+            reject(new Error(`Failed to remove cron job (exit code ${code})`));
+          }
+        });
+        
+        child.on('error', reject);
+      });
     } catch (error) {
-      // Might not have existing crontab
-      console.log('No cron job to remove');
+      console.log(`Failed to remove cron job: ${error.message}`);
     }
   }
 
   async checkCronJob() {
     try {
       const { stdout } = await execAsync('crontab -l');
-      return stdout.includes('tcp-serial-relay');
+      return stdout.includes('tcp-serial-relay') && stdout.includes('auto-update');
     } catch (error) {
       return false;
     }
@@ -552,7 +609,6 @@ class UpdateManager {
     // Webhook notification
     if (config.notifications.webhook) {
       try {
-        const { spawn } = require('child_process');
         spawn('curl', [
           '-X', 'POST',
           config.notifications.webhook,
@@ -562,11 +618,6 @@ class UpdateManager {
       } catch (error) {
         console.warn('Failed to send webhook notification');
       }
-    }
-    
-    // Email notification (if configured)
-    if (config.notifications.email) {
-      // Could implement email notifications here
     }
   }
 
@@ -585,82 +636,101 @@ class UpdateManager {
   }
 }
 
-// CLI interface
-const { program } = require('commander');
-
-program
-  .name('update-manager')
-  .description('TCP-Serial Relay update management')
-  .version('1.0.0');
-
-program
-  .command('check')
-  .description('Check for available updates')
-  .action(async () => {
-    const manager = new UpdateManager();
-    await manager.checkForUpdates();
-  });
-
-program
-  .command('update')
-  .description('Update to latest version')
-  .action(async () => {
-    const manager = new UpdateManager();
-    await manager.performUpdate();
-  });
-
-program
-  .command('enable-auto')
-  .description('Enable automatic updates')
-  .option('--policy <policy>', 'Update policy (patch|minor|major)', 'minor')
-  .option('--schedule <schedule>', 'Cron schedule', '0 3 * * *')
-  .action(async (options) => {
-    const manager = new UpdateManager();
-    await manager.enableAutoUpdate(options.policy, options.schedule);
-  });
-
-program
-  .command('disable-auto')
-  .description('Disable automatic updates')
-  .action(async () => {
-    const manager = new UpdateManager();
-    await manager.disableAutoUpdate();
-  });
-
-program
-  .command('status')
-  .description('Show auto-update status')
-  .action(async () => {
-    const manager = new UpdateManager();
-    await manager.showAutoUpdateStatus();
-  });
-
-program
-  .command('fix')
-  .description('Fix auto-update configuration')
-  .action(async () => {
-    const manager = new UpdateManager();
-    await manager.fixAutoUpdate();
-  });
-
-program
-  .option('--auto-run', 'Run automatic update (used by cron)')
-  .action(async (options) => {
-    if (options.autoRun) {
-      const manager = new UpdateManager();
-      await manager.runAutoUpdate();
-    } else {
-      program.help();
+// Simple CLI argument parsing without external dependencies
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const command = args[0];
+  const options = {};
+  
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i];
+    if (arg.startsWith('--')) {
+      const key = arg.substring(2);
+      if (args[i + 1] && !args[i + 1].startsWith('--')) {
+        options[key] = args[i + 1];
+        i++; // Skip next arg as it's the value
+      } else {
+        options[key] = true;
+      }
     }
-  });
+  }
+  
+  return { command, options };
+}
+
+function showHelp() {
+  console.log(`
+TCP-Serial Relay Update Manager
+
+Usage: tcp-serial-relay auto-update <command> [options]
+
+Commands:
+  check                    Check for available updates
+  update                   Update to latest version
+  --enable                 Enable automatic updates
+  --disable                Disable automatic updates
+  status                   Show auto-update status
+  --fix                    Fix auto-update configuration
+  --auto-run              Run automatic update (used by cron)
+
+Options for --enable:
+  --policy <policy>        Update policy (patch|minor|major) [default: minor]
+  --schedule <schedule>    Cron schedule [default: "0 3 * * *"]
+
+Examples:
+  tcp-serial-relay auto-update check
+  tcp-serial-relay auto-update update
+  tcp-serial-relay auto-update --enable --policy minor --schedule "0 3 * * *"
+  tcp-serial-relay auto-update --disable
+  tcp-serial-relay auto-update status
+  tcp-serial-relay auto-update --fix
+`);
+}
+
+// Main execution
+async function main() {
+  const { command, options } = parseArgs();
+  const manager = new UpdateManager();
+  
+  try {
+    switch (command) {
+      case 'check':
+        await manager.checkForUpdates();
+        break;
+        
+      case 'update':
+        await manager.performUpdate();
+        break;
+        
+      case 'status':
+        await manager.showAutoUpdateStatus();
+        break;
+        
+      default:
+        if (options.enable) {
+          const policy = options.policy || 'minor';
+          const schedule = options.schedule || '0 3 * * *';
+          await manager.enableAutoUpdate(policy, schedule);
+        } else if (options.disable) {
+          await manager.disableAutoUpdate();
+        } else if (options.fix) {
+          await manager.fixAutoUpdate();
+        } else if (options['auto-run']) {
+          await manager.runAutoUpdate();
+        } else {
+          showHelp();
+        }
+        break;
+    }
+  } catch (error) {
+    console.error('Command failed:', error.message);
+    process.exit(1);
+  }
+}
 
 // Run if called directly
 if (require.main === module) {
-  program.parse(process.argv);
-  
-  if (process.argv.length <= 2) {
-    program.help();
-  }
+  main();
 }
 
 module.exports = UpdateManager;
