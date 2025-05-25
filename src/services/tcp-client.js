@@ -40,7 +40,7 @@ class TcpClient extends EventEmitter {
       return;
     }
 
-    logger.info('Initiating TCP connection - attempt ' + this.connectionAttempts, {
+    logger.info('Initiating the TCP connection yall - attempt ' + this.connectionAttempts, {
       host: this.config.tcpIp,
       port: this.config.tcpPort
     });
