@@ -235,28 +235,13 @@ program
     });
   });
 
-// Update command with enhanced auto-update features
+// Update command to run the update.js script
 program
   .command('update')
   .description('Update to latest version')
-  .option('--check', 'Check for updates without installing')
-  .option('--auto', 'Enable automatic updates')
-  .option('--policy <policy>', 'Update policy for auto-updates (patch|minor|major)', 'minor')
-  .option('--schedule <schedule>', 'Cron schedule for auto-updates', '0 3 * * *')
-  .action(async (options) => {
-    const updateScript = path.join(__dirname, '..', 'scripts', 'update-manager.js');
-    
-    if (options.auto) {
-      // Enable automatic updates
-      const args = ['enable-auto', '--policy', options.policy, '--schedule', options.schedule];
-      spawn('node', [updateScript, ...args], { stdio: 'inherit' });
-    } else if (options.check) {
-      // Check for updates
-      spawn('node', [updateScript, 'check'], { stdio: 'inherit' });
-    } else {
-      // Perform update
-      spawn('node', [updateScript, 'update'], { stdio: 'inherit' });
-    }
+  .action(async () => {
+    const updateScript = path.join(__dirname, '..', 'scripts', 'update.js');
+    spawn('node', [updateScript], { stdio: 'inherit' });
   });
 
 // Auto-update management command
