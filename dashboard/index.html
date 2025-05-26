@@ -1,127 +1,182 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>TCP-Serial Relay Dashboard</title>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <!-- Include the full dashboard HTML content here -->
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TCP-Serial Relay Dashboard</title>
+  <link rel="stylesheet" href="main.css">
 </head>
 <body>
-    <div id="app">Loading dashboard...</div>
-    <script>
-        // Dashboard JavaScript will be injected here
-        // Including WebSocket connection for real-time updates
-        const ws = new WebSocket('ws://localhost:3000/ws');
+  <header>
+    <h1>TCP-Serial Relay Dashboard</h1>
+    <div id="status-indicator" class="status-unknown">Unknown</div>
+  </header>
+  
+  <nav>
+    <ul>
+      <li><a href="#" data-tab="status" class="active">Status</a></li>
+      <li><a href="#" data-tab="config">Configuration</a></li>
+      <li><a href="#" data-tab="logs">Logs</a></li>
+    </ul>
+  </nav>
+  
+  <main>
+    <!-- Status Tab -->
+    <section id="status-tab" class="tab-content active">
+      <h2>System Status</h2>
+      <div class="status-cards">
+        <div class="status-card">
+          <h3>TCP Connection</h3>
+          <div id="tcp-status" class="status-indicator">Unknown</div>
+        </div>
+        <div class="status-card">
+          <h3>Serial Connection</h3>
+          <div id="serial-status" class="status-indicator">Unknown</div>
+        </div>
+      </div>
+      
+      <h2>System Metrics</h2>
+      <div class="metrics">
+        <div class="metric">
+          <h3>CPU Usage</h3>
+          <div id="cpu-usage">0%</div>
+        </div>
+        <div class="metric">
+          <h3>Memory Usage</h3>
+          <div id="memory-usage">0%</div>
+        </div>
+        <div class="metric">
+          <h3>Uptime</h3>
+          <div id="uptime">0s</div>
+        </div>
+      </div>
+      
+      <h2>Service Control</h2>
+      <div class="service-control">
+        <button id="start-service">Start Service</button>
+        <button id="stop-service">Stop Service</button>
+        <button id="restart-service">Restart Service</button>
+      </div>
+    </section>
+    
+    <!-- Configuration Tab -->
+    <section id="config-tab" class="tab-content">
+      <h2>Configuration</h2>
+      <form id="config-form">
+        <div class="config-section">
+          <h3>TCP Settings</h3>
+          <div class="form-group">
+            <label for="tcpIp">TCP IP Address</label>
+            <input type="text" id="tcpIp" name="tcpIp">
+          </div>
+          <div class="form-group">
+            <label for="tcpPort">TCP Port</label>
+            <input type="number" id="tcpPort" name="tcpPort">
+          </div>
+        </div>
         
-        ws.onmessage = function(event) {
-            const data = JSON.parse(event.data);
-            updateDashboard(data);
-        };
+        <div class="config-section">
+          <h3>Serial Settings</h3>
+          <div class="form-group">
+            <label for="serialPath">Serial Path</label>
+            <input type="text" id="serialPath" name="serialPath">
+          </div>
+          <div class="form-group">
+            <label for="serialBaud">Baud Rate</label>
+            <input type="number" id="serialBaud" name="serialBaud">
+          </div>
+          <div class="form-group">
+            <label for="serialParity">Parity</label>
+            <select id="serialParity" name="serialParity">
+              <option value="none">None</option>
+              <option value="even">Even</option>
+              <option value="odd">Odd</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="serialDataBits">Data Bits</label>
+            <input type="number" id="serialDataBits" name="serialDataBits" min="5" max="8">
+          </div>
+          <div class="form-group">
+            <label for="serialStopBits">Stop Bits</label>
+            <input type="number" id="serialStopBits" name="serialStopBits" min="1" max="2">
+          </div>
+        </div>
         
-        function updateDashboard(data) {
-            // Update dashboard with real-time data
-            if (data.type === 'status') {
-                currentStatus = data.payload;
-                updateStatus();
-            } else if (data.type === 'log') {
-                addLog(data.payload.level, data.payload.message);
-            } else if (data.type === 'config') {
-                config = data.payload;
-                loadConfig();
-            }
-        }
+        <div class="config-section">
+          <h3>Advanced Settings</h3>
+          <div class="form-group">
+            <label for="maxRetries">Max Retries</label>
+            <input type="number" id="maxRetries" name="maxRetries">
+          </div>
+          <div class="form-group">
+            <label for="retryDelay">Retry Delay (ms)</label>
+            <input type="number" id="retryDelay" name="retryDelay">
+          </div>
+          <div class="form-group">
+            <label for="connectionTimeout">Connection Timeout (ms)</label>
+            <input type="number" id="connectionTimeout" name="connectionTimeout">
+          </div>
+          <div class="form-group">
+            <label for="relayTimeout">Relay Timeout (ms)</label>
+            <input type="number" id="relayTimeout" name="relayTimeout">
+          </div>
+          <div class="form-group">
+            <label for="logDataTransfers">Log Data Transfers</label>
+            <input type="checkbox" id="logDataTransfers" name="logDataTransfers">
+          </div>
+          <div class="form-group">
+            <label for="logLevel">Log Level</label>
+            <select id="logLevel" name="logLevel">
+              <option value="error">Error</option>
+              <option value="warn">Warning</option>
+              <option value="info">Info</option>
+              <option value="debug">Debug</option>
+            </select>
+          </div>
+        </div>
         
-        // API functions for dashboard
-        async function apiCall(endpoint, method = 'GET', data = null) {
-            const options = {
-                method,
-                headers: { 'Content-Type': 'application/json' }
-            };
-            
-            if (data) {
-                options.body = JSON.stringify(data);
-            }
-            
-            const response = await fetch('/api' + endpoint + ', options);
-            return response.json();
-        }
-        
-        // Override the mock functions with real API calls
-        async function loadConfig() {
-            try {
-                const response = await apiCall('/config');
-                config = response.config;
-                // Update form fields
-                document.getElementById('tcp-ip').value = config.tcpIp;
-                document.getElementById('tcp-port').value = config.tcpPort;
-                document.getElementById('serial-path').value = config.serialPath;
-                document.getElementById('serial-baud').value = config.serialBaud;
-                document.getElementById('serial-parity').value = config.serialParity;
-                document.getElementById('log-level').value = config.logLevel;
-            } catch (error) {
-                console.error('Failed to load config:', error);
-            }
-        }
-        
-        async function saveConfig() {
-            try {
-                const newConfig = {
-                    tcpIp: document.getElementById('tcp-ip').value,
-                    tcpPort: parseInt(document.getElementById('tcp-port').value),
-                    serialPath: document.getElementById('serial-path').value,
-                    serialBaud: parseInt(document.getElementById('serial-baud').value),
-                    serialParity: document.getElementById('serial-parity').value,
-                    logLevel: document.getElementById('log-level').value
-                };
-                
-                await apiCall('/config', 'POST', newConfig);
-                addLog('info', 'Configuration saved successfully');
-            } catch (error) {
-                addLog('error', 'Failed to save configuration');
-            }
-        }
-        
-        async function startService() {
-            try {
-                await apiCall('/control/start', 'POST');
-                addLog('info', 'Start command sent');
-            } catch (error) {
-                addLog('error', 'Failed to start service');
-            }
-        }
-        
-        async function stopService() {
-            try {
-                await apiCall('/control/stop', 'POST');
-                addLog('info', 'Stop command sent');
-            } catch (error) {
-                addLog('error', 'Failed to stop service');
-            }
-        }
-        
-        async function restartService() {
-            try {
-                await apiCall('/control/restart', 'POST');
-                addLog('info', 'Restart command sent');
-            } catch (error) {
-                addLog('error', 'Failed to restart service');
-            }
-        }
-        
-        async function checkHealth() {
-            try {
-                const health = await apiCall('/health');
-                const controlOutput = document.getElementById('control-output');
-                controlOutput.innerHTML = `
-                    <div class="log-entry"><span class="log-message">Health Check Results:</span></div>
-                    <div class="log-entry"><span class="log-level-info">[INFO]</span> <span class="log-message">Overall Status: ${health.status}</span></div>
-                    <div class="log-entry"><span class="log-level-info">[INFO]</span> <span class="log-message">Uptime: ${health.uptime}ms</span></div>
-                    <div class="log-entry"><span class="log-level-info">[INFO]</span> <span class="log-message">Health Score: ${health.healthScore || 'N/A'}</span></div>
-                `;
-            } catch (error) {
-                addLog('error', 'Health check failed');
-            }
-        }
-    </script>
+        <div class="form-actions">
+          <button type="submit" id="save-config">Save Configuration</button>
+          <button type="button" id="reset-config">Reset</button>
+        </div>
+      </form>
+    </section>
+    
+    <!-- Logs Tab -->
+    <section id="logs-tab" class="tab-content">
+      <h2>System Logs</h2>
+      <div class="log-controls">
+        <label for="log-lines">Lines to show:</label>
+        <select id="log-lines">
+          <option value="10">10</option>
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+          <option value="200">200</option>
+        </select>
+        <button id="refresh-logs">Refresh</button>
+      </div>
+      <div class="log-container">
+        <table id="log-table">
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Level</th>
+              <th>Message</th>
+            </tr>
+          </thead>
+          <tbody id="log-entries">
+            <!-- Log entries will be added here dynamically -->
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  
+  <footer>
+    <p>TCP-Serial Relay Dashboard &copy; 2025</p>
+  </footer>
+  
+  <script src="main.js"></script>
 </body>
 </html>
