@@ -351,100 +351,97 @@ program
     });
   });
 
-// Dashboard command - run both relay service and dashboard
+// Clean dashboard command for bin/tcp-serial-relay.js
+// Replace the existing dashboard command with this:
+
 program
   .command('dashboard')
-  .description('Start the relay service with web dashboard')
-  .option('-c, --config <path>', 'Configuration file path')
+  .description('Start the web dashboard')
   .option('-p, --port <port>', 'Dashboard port', '3000')
-  .option('--mock', 'Run in mock mode for testing')
+  .option('--host <host>', 'Dashboard host', '0.0.0.0')
+  .option('-c, --config <path>', 'Configuration file path')
   .option('--debug', 'Enable debug logging')
   .action(async (options) => {
-    const appPath = path.join(__dirname, '..', 'src', 'app.js');
-    const dashboardPath = path.join(__dirname, '..', 'dashboard');
-    const env = { ...process.env };
+    console.log('🚀 Starting TCP-Serial Relay Dashboard...');
     
-    if (options.config) {
-      env.CONFIG_PATH = options.config;
-    }
-    
-    if (options.mock) {
-      env.MOCK_ENV = 'true';
-      env.LOG_LEVEL = 'debug';
-    }
-    
-    if (options.debug) {
-      env.LOG_LEVEL = 'debug';
-    }
-    
-    // Set dashboard port
-    env.PORT = options.port;
-    
-    console.log('Starting TCP-Serial/TCP Relay service...');
-    // Start the relay service as a background process
-    const relayProcess = spawn('node', [appPath], {
-      detached: true,
-      stdio: 'ignore',
-      env
-    });
-    relayProcess.unref();
-    console.log(`Relay service started with PID: ${relayProcess.pid}`);
-    
-    console.log('Installing dashboard dependencies...');
     try {
-      // Install dashboard dependencies
-      execSync('npm install', {
-        cwd: dashboardPath,
-        stdio: 'inherit'
-      });
+      // Define paths
+      const dashboardDir = path.join(__dirname, '..', 'src', 'dashboard');
+      const dashboardServerPath = path.join(dashboardDir, 'server.js');
       
-      console.log(`Starting dashboard on port ${options.port}...`);
-      console.log('Press Ctrl+C to stop both the relay service and dashboard');
-      
-      // Start the simple dashboard server
-      const dashboardProcess = spawn('node', ['server.js'], {
-        cwd: dashboardPath,
-        stdio: 'inherit',
-        env
-      });
-      
-      // Handle dashboard process exit
-      dashboardProcess.on('exit', (code) => {
-        console.log(`Dashboard exited with code ${code}`);
-        // Also stop the relay service when dashboard is stopped
-        try {
-          process.kill(relayProcess.pid, 'SIGTERM');
-          console.log(`Stopped relay service with PID: ${relayProcess.pid}`);
-        } catch (error) {
-          console.warn(`Could not stop relay service: ${error.message}`);
-        }
-        process.exit(code);
-      });
-      
-      // Handle SIGINT (Ctrl+C) to gracefully shut down both processes
-      process.on('SIGINT', () => {
-        console.log('\nShutting down relay service and dashboard...');
-        try {
-          process.kill(relayProcess.pid, 'SIGTERM');
-          console.log(`Stopped relay service with PID: ${relayProcess.pid}`);
-        } catch (error) {
-          console.warn(`Could not stop relay service: ${error.message}`);
-        }
-        dashboardProcess.kill();
-        process.exit(0);
-      });
-    } catch (error) {
-      console.error('Error installing dashboard dependencies:', error.message);
-      // Stop the relay service if dashboard fails to start
-      try {
-        process.kill(relayProcess.pid, 'SIGTERM');
-        console.log(`Stopped relay service with PID: ${relayProcess.pid}`);
-      } catch (err) {
-        console.warn(`Could not stop relay service: ${err.message}`);
+      // Verify dashboard server exists
+      if (!fs.existsSync(dashboardServerPath)) {
+        console.error('❌ Dashboard server not found:', dashboardServerPath);
+        console.error('');
+        console.error('Expected file: src/dashboard/server.js');
+        process.exit(1);
       }
+      
+      // Set environment variables
+      const env = { 
+        ...process.env,
+        PORT: options.port,
+        DASHBOARD_PORT: options.port,
+        HOST: options.host,
+        NODE_ENV: options.debug ? 'development' : 'production'
+      };
+      
+      if (options.config) {
+        env.CONFIG_PATH = options.config;
+      }
+      
+      if (options.debug) {
+        env.LOG_LEVEL = 'debug';
+      }
+      
+      // Display startup info
+      console.log(`🌐 Starting dashboard on port ${options.port}`);
+      console.log(`🔗 URL: http://localhost:${options.port}`);
+      if (options.config) {
+        console.log(`⚙️  Config: ${options.config}`);
+      }
+      console.log('');
+      
+      // Start the dashboard server
+      const child = spawn('node', [dashboardServerPath], {
+        stdio: 'inherit',
+        env,
+        cwd: dashboardDir
+      });
+      
+      // Handle process events
+      child.on('error', (error) => {
+        console.error('❌ Dashboard process error:', error.message);
+        process.exit(1);
+      });
+      
+      child.on('exit', (code, signal) => {
+        if (signal) {
+          console.log(`\n🛑 Dashboard stopped by signal: ${signal}`);
+        } else if (code !== 0) {
+          console.error(`❌ Dashboard exited with code ${code}`);
+          process.exit(code);
+        }
+      });
+      
+      // Handle SIGINT (Ctrl+C) to gracefully shut down
+      process.on('SIGINT', () => {
+        console.log('\n🛑 Shutting down dashboard...');
+        child.kill('SIGTERM');
+        
+        // Force exit after 3 seconds if graceful shutdown fails
+        setTimeout(() => {
+          child.kill('SIGKILL');
+          process.exit(0);
+        }, 3000);
+      });
+      
+    } catch (error) {
+      console.error('❌ Failed to start dashboard:', error.message);
       process.exit(1);
     }
   });
+
 
 // Parse command line arguments
 program.parse(process.argv);
