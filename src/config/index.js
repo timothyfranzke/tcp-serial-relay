@@ -5,9 +5,38 @@ const { logger } = require('../utils/logger');
 const { getDeviceId } = require('../utils/device-info');
 const defaultConfig = require('./default-config');
 
+/**
+ * Get the configuration file path with proper precedence
+ */
+function getConfigPath() {
+  // 1. Environment variable override (highest priority)
+  if (process.env.CONFIG_PATH) {
+    return process.env.CONFIG_PATH;
+  }
+
+  // 2. System-wide config (for production deployments)
+  const systemConfigPath = '/etc/tcp-serial-relay/relay-config.json';
+  if (fs.existsSync(systemConfigPath)) {
+    return systemConfigPath;
+  }
+
+  // 3. Local config directory (for development/local use)
+  const localConfigPath = path.join(process.cwd(), 'config', 'relay-config.json');
+  
+  // 4. Fallback to home directory config
+  const homeConfigPath = path.join(require('os').homedir(), '.tcp-serial-relay', 'relay-config.json');
+
+  // Prefer local config if it exists, otherwise use home directory
+  if (fs.existsSync(localConfigPath)) {
+    return localConfigPath;
+  }
+
+  return homeConfigPath;
+}
+
 class ConfigManager {
   constructor() {
-    this.configPath = path.join(process.cwd(), 'config', 'relay-config.json');
+    this.configPath = getConfigPath();
     this.config = null;
   }
 
@@ -18,6 +47,7 @@ class ConfigManager {
 
     const deviceId = getDeviceId();
     logger.info(`Loading configuration for device: ${deviceId}`);
+    logger.info(`Configuration path: ${this.configPath}`);
 
     try {
       this.ensureConfigDirectory();
@@ -27,12 +57,16 @@ class ConfigManager {
       
       logger.info('Configuration loaded successfully', {
         source: fs.existsSync(this.configPath) ? 'file' : 'defaults',
+        configPath: this.configPath,
         config: this.getSafeConfigForLogging()
       });
 
       return this.config;
     } catch (error) {
-      logger.error('Failed to load configuration', { error: error.message });
+      logger.error('Failed to load configuration', { 
+        error: error.message,
+        configPath: this.configPath
+      });
       throw new Error(`Configuration loading failed: ${error.message}`);
     }
   }
@@ -40,8 +74,15 @@ class ConfigManager {
   ensureConfigDirectory() {
     const configDir = path.dirname(this.configPath);
     if (!fs.existsSync(configDir)) {
-      fs.mkdirSync(configDir, { recursive: true });
-      logger.debug(`Created config directory: ${configDir}`);
+      try {
+        fs.mkdirSync(configDir, { recursive: true });
+        logger.info(`Created config directory: ${configDir}`);
+      } catch (error) {
+        logger.warn(`Could not create config directory: ${error.message}`);
+        // Try to use a fallback location
+        this.configPath = path.join(require('os').tmpdir(), 'tcp-serial-relay-config.json');
+        logger.info(`Using fallback config path: ${this.configPath}`);
+      }
     }
   }
 
@@ -53,7 +94,7 @@ class ConfigManager {
         const fileContent = fs.readFileSync(this.configPath, 'utf8');
         const loadedConfig = JSON.parse(fileContent);
         config = { ...defaultConfig, ...loadedConfig };
-        logger.debug('Configuration loaded from existing file');
+        logger.info(`Configuration loaded from existing file: ${this.configPath}`);
       } catch (error) {
         logger.warn('Error reading config file, using defaults', { 
           error: error.message,
@@ -62,8 +103,12 @@ class ConfigManager {
       }
     } else {
       // Create default config file
-      fs.writeFileSync(this.configPath, JSON.stringify(config, null, 2), 'utf8');
-      logger.info('Created default configuration file', { configPath: this.configPath });
+      try {
+        fs.writeFileSync(this.configPath, JSON.stringify(config, null, 2), 'utf8');
+        logger.info(`Created default configuration file: ${this.configPath}`);
+      } catch (error) {
+        logger.warn(`Could not create config file: ${error.message}`);
+      }
     }
 
     return config;
@@ -81,6 +126,11 @@ class ConfigManager {
       logger.debug('TCP port overridden from environment');
     }
 
+    if (process.env.CONNECTION_TYPE) {
+      this.config.connectionType = process.env.CONNECTION_TYPE;
+      logger.debug('Connection type overridden from environment');
+    }
+
     if (process.env.SERIAL_PATH) {
       this.config.serialPath = process.env.SERIAL_PATH;
       logger.debug('Serial path overridden from environment');
@@ -89,6 +139,16 @@ class ConfigManager {
     if (process.env.SERIAL_BAUD) {
       this.config.serialBaud = parseInt(process.env.SERIAL_BAUD, 10);
       logger.debug('Serial baud rate overridden from environment');
+    }
+
+    if (process.env.SECONDARY_TCP_IP) {
+      this.config.secondaryTcpIp = process.env.SECONDARY_TCP_IP;
+      logger.debug('Secondary TCP IP overridden from environment');
+    }
+
+    if (process.env.SECONDARY_TCP_PORT) {
+      this.config.secondaryTcpPort = parseInt(process.env.SECONDARY_TCP_PORT, 10);
+      logger.debug('Secondary TCP port overridden from environment');
     }
 
     // Mock environment override
@@ -111,27 +171,52 @@ class ConfigManager {
       errors.push('Invalid TCP port (must be 1-65535)');
     }
 
-    // Validate Serial configuration
-    if (!this.config.serialPath || typeof this.config.serialPath !== 'string') {
-      errors.push('Invalid serial path');
+    // Validate connection type
+    if (!['serial', 'tcp'].includes(this.config.connectionType)) {
+      errors.push('Invalid connection type (must be "serial" or "tcp")');
     }
 
-    if (!this.config.serialBaud || !Number.isInteger(this.config.serialBaud) || 
-        this.config.serialBaud < 1) {
-      errors.push('Invalid serial baud rate');
+    // Validate Serial configuration if connectionType is 'serial'
+    if (this.config.connectionType === 'serial') {
+      if (!this.config.serialPath || typeof this.config.serialPath !== 'string') {
+        errors.push('Invalid serial path');
+      }
+
+      if (!this.config.serialBaud || !Number.isInteger(this.config.serialBaud) || 
+          this.config.serialBaud < 1) {
+        errors.push('Invalid serial baud rate');
+      }
+
+      const validParities = ['none', 'even', 'odd', 'mark', 'space'];
+      if (!validParities.includes(this.config.serialParity)) {
+        errors.push(`Invalid serial parity (must be one of: ${validParities.join(', ')})`);
+      }
+
+      if (![5, 6, 7, 8].includes(this.config.serialDataBits)) {
+        errors.push('Invalid serial data bits (must be 5, 6, 7, or 8)');
+      }
+
+      if (![1, 1.5, 2].includes(this.config.serialStopBits)) {
+        errors.push('Invalid serial stop bits (must be 1, 1.5, or 2)');
+      }
     }
 
-    const validParities = ['none', 'even', 'odd', 'mark', 'space'];
-    if (!validParities.includes(this.config.serialParity)) {
-      errors.push(`Invalid serial parity (must be one of: ${validParities.join(', ')})`);
-    }
+    // Validate secondary TCP configuration if connectionType is 'tcp'
+    if (this.config.connectionType === 'tcp') {
+      if (!this.config.secondaryTcpIp || typeof this.config.secondaryTcpIp !== 'string') {
+        errors.push('Invalid secondary TCP IP address');
+      }
 
-    if (![5, 6, 7, 8].includes(this.config.serialDataBits)) {
-      errors.push('Invalid serial data bits (must be 5, 6, 7, or 8)');
-    }
+      if (!this.config.secondaryTcpPort || !Number.isInteger(this.config.secondaryTcpPort) || 
+          this.config.secondaryTcpPort < 1 || this.config.secondaryTcpPort > 65535) {
+        errors.push('Invalid secondary TCP port (must be 1-65535)');
+      }
 
-    if (![1, 1.5, 2].includes(this.config.serialStopBits)) {
-      errors.push('Invalid serial stop bits (must be 1, 1.5, or 2)');
+      // Check for port conflicts
+      if (this.config.tcpIp === this.config.secondaryTcpIp && 
+          this.config.tcpPort === this.config.secondaryTcpPort) {
+        errors.push('Primary and secondary TCP endpoints cannot be the same');
+      }
     }
 
     if (errors.length > 0) {
@@ -141,15 +226,24 @@ class ConfigManager {
 
   getSafeConfigForLogging() {
     // Return config without sensitive data for logging
-    return {
+    const safeConfig = {
       tcpIp: this.config.tcpIp,
       tcpPort: this.config.tcpPort,
-      serialPath: this.config.serialPath,
-      serialBaud: this.config.serialBaud,
-      serialParity: this.config.serialParity,
-      serialDataBits: this.config.serialDataBits,
-      serialStopBits: this.config.serialStopBits
+      connectionType: this.config.connectionType
     };
+
+    if (this.config.connectionType === 'serial') {
+      safeConfig.serialPath = this.config.serialPath;
+      safeConfig.serialBaud = this.config.serialBaud;
+      safeConfig.serialParity = this.config.serialParity;
+      safeConfig.serialDataBits = this.config.serialDataBits;
+      safeConfig.serialStopBits = this.config.serialStopBits;
+    } else if (this.config.connectionType === 'tcp') {
+      safeConfig.secondaryTcpIp = this.config.secondaryTcpIp;
+      safeConfig.secondaryTcpPort = this.config.secondaryTcpPort;
+    }
+
+    return safeConfig;
   }
 
   // Allow updating config at runtime
@@ -158,11 +252,20 @@ class ConfigManager {
     this.validateConfig();
     
     // Save to file
-    fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), 'utf8');
-    logger.info('Configuration updated and saved', { 
-      updates: Object.keys(newConfig),
-      config: this.getSafeConfigForLogging()
-    });
+    try {
+      fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), 'utf8');
+      logger.info('Configuration updated and saved', { 
+        updates: Object.keys(newConfig),
+        configPath: this.configPath,
+        config: this.getSafeConfigForLogging()
+      });
+    } catch (error) {
+      logger.error('Failed to save configuration', { 
+        error: error.message,
+        configPath: this.configPath
+      });
+      throw new Error(`Failed to save configuration: ${error.message}`);
+    }
   }
 
   get() {
@@ -171,6 +274,10 @@ class ConfigManager {
     }
     return { ...this.config };
   }
+
+  getConfigPath() {
+    return this.configPath;
+  }
 }
 
 // Singleton instance
@@ -178,6 +285,7 @@ const configManager = new ConfigManager();
 
 module.exports = {
   configManager,
+  getConfigPath,
   loadConfig: () => configManager.load(),
   getConfig: () => configManager.get(),
   updateConfig: (newConfig) => configManager.update(newConfig)

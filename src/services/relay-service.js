@@ -1,26 +1,24 @@
-// src/services/relay-service.js - Enhanced error handling for connection issues
+// src/services/relay-service.js
 const EventEmitter = require('events');
 const { logger } = require('../utils/logger');
 const { updateStatus, updateConnection, incrementMetric, registerConnection } = require('../utils/status-manager');
 const TcpClient = require('./tcp-client');
 const SerialClient = require('./serial-client');
+const SecondaryTcpClient = require('./secondary-tcp-client');
 
 /**
- * Main relay service with robust error handling for connection failures
+ * Main relay service that coordinates TCP and Serial/TCP connections
  */
 class RelayService extends EventEmitter {
   constructor(config) {
     super();
     this.config = config;
     this.tcpClient = null;
-    this.serialClient = null;
+    this.secondaryClient = null; // Can be either SerialClient or SecondaryTcpClient
     this.isRunning = false;
     this.dataRelayed = false;
     this.relayTimeout = null;
     this.startTime = null;
-    this.connectionErrors = new Map();
-    this.maxConnectionErrors = 5;
-    this.errorResetInterval = 60000; // Reset error count every minute
   }
 
   /**
@@ -34,8 +32,8 @@ class RelayService extends EventEmitter {
     }
 
     this.startTime = Date.now();
-    logger.info('Starting TCP-Serial relay service with enhanced error handling', {
-      config: this.config
+    logger.info('Starting TCP-Serial/TCP relay service', {
+      config: this.getSafeConfigForLogging()
     });
 
     updateStatus({ message: 'Initializing relay service...' });
@@ -43,17 +41,25 @@ class RelayService extends EventEmitter {
     try {
       // Initialize clients
       this.tcpClient = new TcpClient(this.config);
-      this.serialClient = new SerialClient(this.config);
+      
+      // Initialize secondary client based on connection type
+      if (this.config.connectionType === 'tcp') {
+        this.secondaryClient = new SecondaryTcpClient(this.config);
+        logger.info('Configured for TCP-to-TCP relay mode');
+      } else {
+        this.secondaryClient = new SerialClient(this.config);
+        logger.info('Configured for TCP-to-Serial relay mode');
+      }
 
       // Register connections for cleanup
       registerConnection('tcp', this.tcpClient);
-      registerConnection('serial', this.serialClient);
+      registerConnection('secondary', this.secondaryClient);
 
-      // Setup enhanced event handlers
-      this.setupEnhancedEventHandlers();
+      // Setup event handlers
+      this.setupEventHandlers();
 
-      // Connect both clients with error resilience
-      await this.connectClientsWithResilience();
+      // Connect both clients
+      await this.connectClients();
 
       // Setup data relay
       this.setupDataRelay();
@@ -61,20 +67,18 @@ class RelayService extends EventEmitter {
       // Start relay timeout
       this.startRelayTimeout();
 
-      // Start error monitoring
-      this.startErrorMonitoring();
-
       this.isRunning = true;
       updateStatus({ 
         message: 'Relay service running and waiting for data...',
         connections: {
           tcp: this.tcpClient.getStats(),
-          serial: this.serialClient.getStats()
+          secondary: this.secondaryClient.getStats()
         }
       });
 
-      logger.info('Relay service started successfully with enhanced error handling', {
-        duration: Date.now() - this.startTime
+      logger.info('Relay service started successfully', {
+        duration: Date.now() - this.startTime,
+        connectionType: this.config.connectionType
       });
 
       this.emit('started');
@@ -87,100 +91,64 @@ class RelayService extends EventEmitter {
   }
 
   /**
-   * Connect both clients with enhanced error handling and resilience
+   * Get safe config for logging (without sensitive data)
+   */
+  getSafeConfigForLogging() {
+    const safeConfig = {
+      tcpIp: this.config.tcpIp,
+      tcpPort: this.config.tcpPort,
+      connectionType: this.config.connectionType
+    };
+
+    if (this.config.connectionType === 'serial') {
+      safeConfig.serialPath = this.config.serialPath;
+      safeConfig.serialBaud = this.config.serialBaud;
+    } else if (this.config.connectionType === 'tcp') {
+      safeConfig.secondaryTcpIp = this.config.secondaryTcpIp;
+      safeConfig.secondaryTcpPort = this.config.secondaryTcpPort;
+    }
+
+    return safeConfig;
+  }
+
+  /**
+   * Connect both TCP and Secondary clients
    * @returns {Promise} Promise that resolves when both are connected
    */
-  async connectClientsWithResilience() {
-    logger.info('Connecting to TCP and Serial endpoints with error resilience...');
-
-    const connectionPromises = [];
+  async connectClients() {
+    const secondaryType = this.config.connectionType === 'tcp' ? 'secondary TCP' : 'Serial';
+    logger.info(`Connecting to TCP and ${secondaryType} endpoints...`);
 
     // Connect TCP client
-    connectionPromises.push(
-      this.connectTcpWithRetry().catch(error => {
-        logger.error('Failed to establish TCP connection', { error: error.message });
-        throw new Error(`TCP connection failed: ${error.message}`);
-      })
-    );
-
-    // Connect Serial client  
-    connectionPromises.push(
-      this.connectSerialWithRetry().catch(error => {
-        logger.error('Failed to establish Serial connection', { error: error.message });
-        throw new Error(`Serial connection failed: ${error.message}`);
-      })
-    );
-
-    // Wait for both connections with timeout
-    try {
-      await Promise.all(connectionPromises);
-      logger.info('Both connections established successfully');
-      incrementMetric('totalConnections');
-    } catch (error) {
-      // If either connection fails, clean up and throw
-      logger.error('Connection establishment failed', { error: error.message });
-      await this.cleanupConnections();
-      throw error;
-    }
-  }
-
-  /**
-   * Connect TCP client with enhanced retry logic
-   * @returns {Promise} Promise that resolves when TCP is connected
-   */
-  async connectTcpWithRetry() {
     updateStatus({ message: 'Connecting to TCP server...' });
-    
-    try {
-      await this.tcpClient.connect();
-      updateConnection('tcp', { 
-        connected: true, 
-        ...this.tcpClient.getStats() 
-      });
-      logger.info('TCP connection established successfully');
-    } catch (error) {
-      updateConnection('tcp', { 
-        connected: false, 
-        error: error.message,
-        ...this.tcpClient.getStats() 
-      });
-      throw error;
-    }
+    await this.tcpClient.connect();
+    updateConnection('tcp', { 
+      connected: true, 
+      ...this.tcpClient.getStats() 
+    });
+
+    // Connect Secondary client
+    updateStatus({ message: `Connecting to ${secondaryType} endpoint...` });
+    await this.secondaryClient.connect();
+    updateConnection('secondary', { 
+      connected: true, 
+      ...this.secondaryClient.getStats() 
+    });
+
+    logger.info('Both connections established successfully');
+    incrementMetric('totalConnections');
   }
 
   /**
-   * Connect Serial client with enhanced retry logic
-   * @returns {Promise} Promise that resolves when Serial is connected
+   * Setup event handlers for both clients
    */
-  async connectSerialWithRetry() {
-    updateStatus({ message: 'Connecting to Serial port...' });
-    
-    try {
-      await this.serialClient.connect();
-      updateConnection('serial', { 
-        connected: true, 
-        ...this.serialClient.getStats() 
-      });
-      logger.info('Serial connection established successfully');
-    } catch (error) {
-      updateConnection('serial', { 
-        connected: false, 
-        error: error.message,
-        ...this.serialClient.getStats() 
-      });
-      throw error;
-    }
-  }
+  setupEventHandlers() {
+    const secondaryType = this.config.connectionType === 'tcp' ? 'Secondary TCP' : 'Serial';
 
-  /**
-   * Setup enhanced event handlers with proper error handling
-   */
-  setupEnhancedEventHandlers() {
-    // TCP Client events with enhanced error handling
+    // TCP Client events
     this.tcpClient.on('connected', (info) => {
       logger.info('TCP client connected', info);
       updateConnection('tcp', { connected: true, ...info });
-      this.resetConnectionErrors('tcp');
     });
 
     this.tcpClient.on('disconnected', (info) => {
@@ -189,182 +157,91 @@ class RelayService extends EventEmitter {
       this.handleDisconnection('tcp', info);
     });
 
-    // Enhanced TCP error handling
-    this.tcpClient.on('error', (errorInfo) => {
-      this.handleConnectionError('tcp', errorInfo);
-    });
-
     this.tcpClient.on('data', (data, metadata) => {
       this.handleDataFromTcp(data, metadata);
     });
 
-    this.tcpClient.on('dataError', (error) => {
-      logger.error('TCP data processing error', { error: error.message });
-      incrementMetric('errors');
+    // Secondary Client events
+    this.secondaryClient.on('connected', (info) => {
+      logger.info(`${secondaryType} client connected`, info);
+      updateConnection('secondary', { connected: true, ...info });
     });
 
-    // Serial Client events with enhanced error handling
-    this.serialClient.on('connected', (info) => {
-      logger.info('Serial client connected', info);
-      updateConnection('serial', { connected: true, ...info });
-      this.resetConnectionErrors('serial');
+    this.secondaryClient.on('disconnected', (info) => {
+      logger.warn(`${secondaryType} client disconnected`, info);
+      updateConnection('secondary', { connected: false, ...info });
+      this.handleDisconnection('secondary', info);
     });
 
-    this.serialClient.on('disconnected', (info) => {
-      logger.warn('Serial client disconnected', info);
-      updateConnection('serial', { connected: false, ...info });
-      this.handleDisconnection('serial', info);
-    });
-
-    // Enhanced Serial error handling (if similar errors occur)
-    this.serialClient.on('error', (errorInfo) => {
-      this.handleConnectionError('serial', errorInfo);
-    });
-
-    this.serialClient.on('data', (data, metadata) => {
-      this.handleDataFromSerial(data, metadata);
-    });
-
-    this.serialClient.on('dataError', (error) => {
-      logger.error('Serial data processing error', { error: error.message });
-      incrementMetric('errors');
+    this.secondaryClient.on('data', (data, metadata) => {
+      this.handleDataFromSecondary(data, metadata);
     });
   }
 
   /**
-   * Handle connection errors with tracking and decision logic
-   * @param {string} clientType - Type of client (tcp/serial)
-   * @param {object} errorInfo - Error information
+   * Setup bidirectional data relay
    */
-  handleConnectionError(clientType, errorInfo) {
-    // Track error count
-    const errorCount = this.incrementConnectionErrors(clientType);
+  setupDataRelay() {
+    const secondaryType = this.config.connectionType === 'tcp' ? 'Secondary TCP' : 'Serial';
+    logger.info(`Setting up bidirectional data relay (TCP <-> ${secondaryType})`);
     
-    logger.error(`${clientType} connection error (${errorCount}/${this.maxConnectionErrors})`, {
-      ...errorInfo,
-      errorCount,
-      isRetryable: errorInfo.retryable
-    });
-
-    incrementMetric('errors');
-
-    // Emit error event for monitoring
-    this.emit('connectionError', {
-      clientType,
-      errorInfo,
-      errorCount,
-      shouldContinue: errorCount < this.maxConnectionErrors
-    });
-
-    // If error count exceeds threshold and not retryable, consider stopping
-    if (errorCount >= this.maxConnectionErrors && !errorInfo.retryable) {
-      logger.error(`${clientType} connection has too many non-retryable errors, stopping relay`, {
-        errorCount,
-        maxErrors: this.maxConnectionErrors
-      });
-      
-      this.emit('stopped', {
-        success: this.dataRelayed,
-        reason: `${clientType} connection failed with ${errorCount} errors`
-      });
-    }
+    // Data relay is handled by the event handlers
+    // tcpClient 'data' event -> handleDataFromTcp -> secondaryClient.send
+    // secondaryClient 'data' event -> handleDataFromSecondary -> tcpClient.send
   }
 
   /**
-   * Increment connection error count
-   * @param {string} clientType - Type of client
-   * @returns {number} Current error count
-   */
-  incrementConnectionErrors(clientType) {
-    const current = this.connectionErrors.get(clientType) || 0;
-    const newCount = current + 1;
-    this.connectionErrors.set(clientType, newCount);
-    return newCount;
-  }
-
-  /**
-   * Reset connection error count
-   * @param {string} clientType - Type of client
-   */
-  resetConnectionErrors(clientType) {
-    if (this.connectionErrors.has(clientType)) {
-      logger.debug(`Reset error count for ${clientType} client`);
-      this.connectionErrors.delete(clientType);
-    }
-  }
-
-  /**
-   * Start error monitoring and periodic reset
-   */
-  startErrorMonitoring() {
-    // Reset error counts periodically
-    this.errorResetTimer = setInterval(() => {
-      if (this.connectionErrors.size > 0) {
-        logger.debug('Resetting connection error counts', {
-          previousErrors: Object.fromEntries(this.connectionErrors)
-        });
-        this.connectionErrors.clear();
-      }
-    }, this.errorResetInterval);
-  }
-
-  /**
-   * Handle data received from TCP client with error protection
+   * Handle data received from TCP client
    * @param {Buffer} data - Received data
    * @param {object} metadata - Data metadata
    */
   async handleDataFromTcp(data, metadata) {
     try {
-      logger.debug('Relaying data from TCP to Serial', {
+      const destinationType = this.config.connectionType === 'tcp' ? 'Secondary TCP' : 'Serial';
+      logger.debug(`Relaying data from TCP to ${destinationType}`, {
         bytes: data.length,
         hex: metadata.hex
       });
 
-      await this.serialClient.send(data);
+      await this.secondaryClient.send(data);
       
       this.markDataRelayed();
-      incrementMetric('bytesTransferredTcpToSerial', data.length);
+      
+      const metricName = this.config.connectionType === 'tcp' ? 
+        'bytesTransferredTcpToSecondaryTcp' : 'bytesTransferredTcpToSerial';
+      incrementMetric(metricName, data.length);
       incrementMetric('dataTransfers');
 
       this.emit('dataRelayed', {
-        direction: 'tcp-to-serial',
+        direction: this.config.connectionType === 'tcp' ? 'tcp-to-secondary-tcp' : 'tcp-to-serial',
         bytes: data.length,
         metadata
       });
 
     } catch (error) {
-      logger.error('Failed to relay data from TCP to Serial', {
+      const destinationType = this.config.connectionType === 'tcp' ? 'Secondary TCP' : 'Serial';
+      logger.error(`Failed to relay data from TCP to ${destinationType}`, {
         error: error.message,
-        code: error.code,
         dataLength: data.length
       });
       incrementMetric('errors');
-      
       this.emit('relayError', {
-        direction: 'tcp-to-serial',
+        direction: this.config.connectionType === 'tcp' ? 'tcp-to-secondary-tcp' : 'tcp-to-serial',
         error: error.message,
-        retryable: this.isRetryableDataError(error),
         data
       });
-
-      // If it's a critical error, consider stopping
-      if (!this.isRetryableDataError(error)) {
-        this.handleConnectionError('serial', {
-          error: error.message,
-          retryable: false
-        });
-      }
     }
   }
 
   /**
-   * Handle data received from Serial client with error protection
+   * Handle data received from Secondary client (Serial or TCP)
    * @param {Buffer} data - Received data
    * @param {object} metadata - Data metadata
    */
-  async handleDataFromSerial(data, metadata) {
+  async handleDataFromSecondary(data, metadata) {
     try {
-      logger.debug('Relaying data from Serial to TCP', {
+      const sourceType = this.config.connectionType === 'tcp' ? 'Secondary TCP' : 'Serial';
+      logger.debug(`Relaying data from ${sourceType} to TCP`, {
         bytes: data.length,
         hex: metadata.hex
       });
@@ -372,84 +249,61 @@ class RelayService extends EventEmitter {
       await this.tcpClient.send(data);
       
       this.markDataRelayed();
-      incrementMetric('bytesTransferredSerialToTcp', data.length);
+      
+      const metricName = this.config.connectionType === 'tcp' ? 
+        'bytesTransferredSecondaryTcpToTcp' : 'bytesTransferredSerialToTcp';
+      incrementMetric(metricName, data.length);
       incrementMetric('dataTransfers');
 
       this.emit('dataRelayed', {
-        direction: 'serial-to-tcp',
+        direction: this.config.connectionType === 'tcp' ? 'secondary-tcp-to-tcp' : 'serial-to-tcp',
         bytes: data.length,
         metadata
       });
 
     } catch (error) {
-      logger.error('Failed to relay data from Serial to TCP', {
+      const sourceType = this.config.connectionType === 'tcp' ? 'Secondary TCP' : 'Serial';
+      logger.error(`Failed to relay data from ${sourceType} to TCP`, {
         error: error.message,
-        code: error.code,
         dataLength: data.length
       });
       incrementMetric('errors');
-      
       this.emit('relayError', {
-        direction: 'serial-to-tcp',
+        direction: this.config.connectionType === 'tcp' ? 'secondary-tcp-to-tcp' : 'serial-to-tcp',
         error: error.message,
-        retryable: this.isRetryableDataError(error),
         data
       });
-
-      // If it's a critical error, consider stopping
-      if (!this.isRetryableDataError(error)) {
-        this.handleConnectionError('tcp', {
-          error: error.message,
-          retryable: false
-        });
-      }
     }
   }
 
   /**
-   * Check if a data relay error is retryable
-   * @param {Error} error - Error to check
-   * @returns {boolean} True if retryable
-   */
-  isRetryableDataError(error) {
-    // Temporary network issues are retryable
-    const retryableCodes = ['ECONNRESET', 'ETIMEDOUT', 'ENOTCONN'];
-    return retryableCodes.includes(error.code);
-  }
-
-  /**
-   * Handle client disconnection with enhanced logic
+   * Handle client disconnection
    * @param {string} clientType - Type of client that disconnected
    * @param {object} info - Disconnection info
    */
   handleDisconnection(clientType, info) {
-    logger.warn(`${clientType} client disconnected`, info);
+    const clientName = clientType === 'tcp' ? 'TCP' : 
+      (this.config.connectionType === 'tcp' ? 'Secondary TCP' : 'Serial');
+    
+    logger.warn(`${clientName} client disconnected`, info);
     
     updateConnection(clientType, { connected: false, ...info });
     
     this.emit('clientDisconnected', {
       clientType,
+      clientName,
       info,
-      hadDataRelay: this.dataRelayed,
-      isExpectedDisconnect: info.isClosing || false
+      hadDataRelay: this.dataRelayed
     });
 
-    // Only stop if it's not an expected disconnect and we're still running
-    if (this.isRunning && !info.isClosing) {
-      const message = `${clientType} connection lost${this.dataRelayed ? ' after successful data relay' : ' before data relay'}`;
+    // If either client disconnects, stop the relay
+    if (this.isRunning) {
+      const message = `${clientName} connection lost${this.dataRelayed ? ' after successful data relay' : ' before data relay'}`;
       this.emit('stopped', {
         success: this.dataRelayed,
         reason: message
       });
     }
-  }
-
-  /**
-   * Setup bidirectional data relay
-   */
-  setupDataRelay() {
-    logger.info('Setting up bidirectional data relay with error protection');
-    // Data relay is handled by the enhanced event handlers
   }
 
   /**
@@ -476,9 +330,7 @@ class RelayService extends EventEmitter {
         logger.warn('Relay timeout: No data transferred within timeout period', {
           timeoutMs,
           tcpConnected: this.tcpClient?.isConnected,
-          serialConnected: this.serialClient?.isConnected,
-          tcpErrors: this.connectionErrors.get('tcp') || 0,
-          serialErrors: this.connectionErrors.get('serial') || 0
+          secondaryConnected: this.secondaryClient?.isConnected
         });
         
         this.emit('timeout', {
@@ -500,97 +352,17 @@ class RelayService extends EventEmitter {
   }
 
   /**
-   * Clean up connections during error scenarios
-   */
-  async cleanupConnections() {
-    const cleanupPromises = [];
-    
-    if (this.tcpClient) {
-      cleanupPromises.push(
-        this.safeCloseConnection('TCP', this.tcpClient)
-      );
-    }
-    
-    if (this.serialClient) {
-      cleanupPromises.push(
-        this.safeCloseConnection('Serial', this.serialClient)
-      );
-    }
-    
-    await Promise.all(cleanupPromises);
-  }
-
-  /**
-   * Safely close a connection with fallback methods
-   * @param {string} clientName - Name for logging
-   * @param {object} client - Client to close
-   * @returns {Promise} Promise that resolves when closed
-   */
-  async safeCloseConnection(clientName, client) {
-    try {
-      if (!client) {
-        logger.debug(`${clientName} client is null, skipping cleanup`);
-        return;
-      }
-
-      // Try close method first
-      if (typeof client.close === 'function') {
-        await client.close();
-        logger.debug(`${clientName} client closed successfully`);
-        return;
-      }
-
-      // Try destroy method as fallback
-      if (typeof client.destroy === 'function') {
-        client.destroy();
-        logger.debug(`${clientName} client destroyed successfully`);
-        return;
-      }
-
-      // Try disconnect method as fallback
-      if (typeof client.disconnect === 'function') {
-        await client.disconnect();
-        logger.debug(`${clientName} client disconnected successfully`);
-        return;
-      }
-
-      // If client has a socket/port property, try to close it
-      if (client.socket && typeof client.socket.destroy === 'function') {
-        client.socket.destroy();
-        logger.debug(`${clientName} client socket destroyed successfully`);
-        return;
-      }
-
-      if (client.port && typeof client.port.close === 'function') {
-        client.port.close();
-        logger.debug(`${clientName} client port closed successfully`);
-        return;
-      }
-
-      logger.warn(`${clientName} client has no known close method, cleanup may be incomplete`);
-
-    } catch (error) {
-      logger.warn(`Error during ${clientName} cleanup`, { 
-        error: error.message,
-        hasClose: typeof client.close === 'function',
-        hasDestroy: typeof client.destroy === 'function',
-        hasDisconnect: typeof client.disconnect === 'function'
-      });
-    }
-  }
-
-  /**
    * Get total bytes transferred in both directions
    * @returns {number} Total bytes transferred
    */
   getTotalBytesTransferred() {
     const tcpStats = this.tcpClient?.getStats() || {};
-    const serialStats = this.serialClient?.getStats() || {};
+    const secondaryStats = this.secondaryClient?.getStats() || {};
     
     return (tcpStats.totalBytesReceived || 0) + 
            (tcpStats.totalBytesSent || 0) + 
-           (serialStats.totalBytesReceived || 0) + 
-           (serialStats.totalBytesSent || 0);
+           (secondaryStats.totalBytesReceived || 0) + 
+           (secondaryStats.totalBytesSent || 0);
   }
 
   /**
@@ -598,26 +370,22 @@ class RelayService extends EventEmitter {
    * @returns {object} Relay statistics
    */
   getStats() {
+    const connectionType = this.config.connectionType;
+    
     return {
       isRunning: this.isRunning,
       dataRelayed: this.dataRelayed,
       duration: this.startTime ? Date.now() - this.startTime : 0,
       totalBytesTransferred: this.getTotalBytesTransferred(),
-      connectionErrors: Object.fromEntries(this.connectionErrors),
+      connectionType: connectionType,
       tcp: this.tcpClient?.getStats() || null,
-      serial: this.serialClient?.getStats() || null,
-      config: {
-        tcpIp: this.config.tcpIp,
-        tcpPort: this.config.tcpPort,
-        serialPath: this.config.serialPath,
-        serialBaud: this.config.serialBaud,
-        relayTimeout: this.config.relayTimeout
-      }
+      secondary: this.secondaryClient?.getStats() || null,
+      config: this.getSafeConfigForLogging()
     };
   }
 
   /**
-   * Stop the relay service with enhanced cleanup
+   * Stop the relay service
    * @returns {Promise} Promise that resolves when stopped
    */
   async stop() {
@@ -626,22 +394,38 @@ class RelayService extends EventEmitter {
       return;
     }
 
-    logger.info('Stopping relay service with enhanced cleanup...');
+    logger.info('Stopping relay service...');
     this.isRunning = false;
 
-    // Clear timeouts
+    // Clear timeout
     if (this.relayTimeout) {
       clearTimeout(this.relayTimeout);
       this.relayTimeout = null;
     }
 
-    if (this.errorResetTimer) {
-      clearInterval(this.errorResetTimer);
-      this.errorResetTimer = null;
+    const stopPromises = [];
+
+    // Close TCP client
+    if (this.tcpClient) {
+      stopPromises.push(
+        this.tcpClient.close().catch(error => {
+          logger.warn('Error closing TCP client', { error: error.message });
+        })
+      );
     }
 
-    // Clean up connections using safe method
-    await this.cleanupConnections();
+    // Close Secondary client
+    if (this.secondaryClient) {
+      stopPromises.push(
+        this.secondaryClient.close().catch(error => {
+          const clientType = this.config.connectionType === 'tcp' ? 'Secondary TCP' : 'Serial';
+          logger.warn(`Error closing ${clientType} client`, { error: error.message });
+        })
+      );
+    }
+
+    // Wait for all connections to close
+    await Promise.all(stopPromises);
 
     const finalStats = this.getStats();
     
@@ -649,14 +433,14 @@ class RelayService extends EventEmitter {
       dataRelayed: this.dataRelayed,
       duration: finalStats.duration,
       totalBytesTransferred: finalStats.totalBytesTransferred,
-      connectionErrors: finalStats.connectionErrors
+      connectionType: this.config.connectionType
     });
 
     updateStatus({
       message: this.dataRelayed ? 'Relay service stopped after successful data transfer' : 'Relay service stopped without data transfer',
       connections: {
         tcp: { connected: false },
-        serial: { connected: false }
+        secondary: { connected: false }
       }
     });
 
@@ -674,12 +458,10 @@ class RelayService extends EventEmitter {
     return {
       isRunning: this.isRunning,
       dataRelayed: this.dataRelayed,
+      connectionType: this.config.connectionType,
       tcpConnected: this.tcpClient?.isConnected || false,
-      serialConnected: this.serialClient?.isConnected || false,
-      tcpHealthy: this.tcpClient?.isHealthy() || false,
-      serialHealthy: this.serialClient?.isHealthy?.() || this.serialClient?.isConnected || false,
+      secondaryConnected: this.secondaryClient?.isConnected || false,
       uptime: this.startTime ? Date.now() - this.startTime : 0,
-      connectionErrors: Object.fromEntries(this.connectionErrors),
       lastActivity: this.getLastActivity()
     };
   }

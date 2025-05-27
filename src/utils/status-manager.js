@@ -24,8 +24,13 @@ class StatusManager {
       error: null,
       connections: {},
       metrics: {
+        // TCP to Serial metrics
         bytesTransferredTcpToSerial: 0,
         bytesTransferredSerialToTcp: 0,
+        // TCP to TCP metrics
+        bytesTransferredTcpToSecondaryTcp: 0,
+        bytesTransferredSecondaryTcpToTcp: 0,
+        // General metrics
         totalConnections: 0,
         dataTransfers: 0,
         errors: 0
@@ -51,7 +56,7 @@ class StatusManager {
 
   /**
    * Update connection status
-   * @param {string} connectionType - Type of connection (tcp, serial)
+   * @param {string} connectionType - Type of connection (tcp, serial, secondary)
    * @param {object} connectionStatus - Connection details
    */
   updateConnection(connectionType, connectionStatus) {

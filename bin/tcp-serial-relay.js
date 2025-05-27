@@ -5,7 +5,7 @@
 const { Command } = require('commander');
 const path = require('path');
 const fs = require('fs');
-const { exec, spawn } = require('child_process');
+const { exec, spawn, execSync } = require('child_process');
 const { promisify } = require('util');
 
 const execAsync = promisify(exec);
@@ -17,7 +17,7 @@ const packageInfo = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
 
 program
   .name('tcp-serial-relay')
-  .description('TCP to Serial relay service for Raspberry Pi')
+  .description('TCP to Serial/TCP relay service for Raspberry Pi')
   .version(packageInfo.version);
 
 // Start command
@@ -28,6 +28,8 @@ program
   .option('-d, --daemon', 'Run as daemon')
   .option('--mock', 'Run in mock mode for testing')
   .option('--debug', 'Enable debug logging')
+  .option('--tcp', 'Force TCP-to-TCP mode')
+  .option('--serial', 'Force TCP-to-Serial mode')
   .action(async (options) => {
     const appPath = path.join(__dirname, '..', 'src', 'app.js');
     const env = { ...process.env };
@@ -43,6 +45,16 @@ program
     
     if (options.debug) {
       env.LOG_LEVEL = 'debug';
+    }
+
+    if (options.tcp) {
+      env.CONNECTION_TYPE = 'tcp';
+      console.log('Forcing TCP-to-TCP relay mode');
+    }
+
+    if (options.serial) {
+      env.CONNECTION_TYPE = 'serial';
+      console.log('Forcing TCP-to-Serial relay mode');
     }
     
     if (options.daemon) {
@@ -168,7 +180,54 @@ program
   .option('--edit', 'Edit configuration file')
   .option('--reset', 'Reset to default configuration')
   .option('--validate', 'Validate configuration')
+  .option('--set-tcp', 'Set connection type to TCP')
+  .option('--set-serial', 'Set connection type to Serial')
   .action(async (options) => {
+    if (options.setTcp || options.setSerial) {
+      // Handle connection type changes
+      const configPath = process.env.CONFIG_PATH || path.join(process.cwd(), 'config', 'relay-config.json');
+      
+      try {
+        let config = {};
+        if (fs.existsSync(configPath)) {
+          config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        }
+        
+        if (options.setTcp) {
+          config.connectionType = 'tcp';
+          console.log('Set connection type to TCP');
+          
+          // Set default secondary TCP settings if not present
+          if (!config.secondaryTcpIp) config.secondaryTcpIp = '192.168.1.91';
+          if (!config.secondaryTcpPort) config.secondaryTcpPort = 10003;
+        }
+        
+        if (options.setSerial) {
+          config.connectionType = 'serial';
+          console.log('Set connection type to Serial');
+          
+          // Set default serial settings if not present
+          if (!config.serialPath) config.serialPath = '/dev/ttyUSB0';
+          if (!config.serialBaud) config.serialBaud = 9600;
+        }
+        
+        // Ensure config directory exists
+        const configDir = path.dirname(configPath);
+        if (!fs.existsSync(configDir)) {
+          fs.mkdirSync(configDir, { recursive: true });
+        }
+        
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+        console.log(`Configuration updated: ${configPath}`);
+        console.log('Run "tcp-serial-relay config --show" to view the current configuration');
+        
+      } catch (error) {
+        console.error('Failed to update configuration:', error.message);
+        process.exit(1);
+      }
+      return;
+    }
+    
     const configScript = path.join(__dirname, '..', 'scripts', 'config-manager.js');
     
     const args = [];
@@ -267,6 +326,123 @@ program
     } else {
       // Default: show status
       spawn('node', [updateScript, 'status'], { stdio: 'inherit' });
+    }
+  });
+
+// Test connection command
+program
+  .command('test')
+  .description('Test connection configuration')
+  .option('-c, --config <path>', 'Configuration file path')
+  .option('--tcp', 'Test TCP-to-TCP configuration')
+  .option('--serial', 'Test TCP-to-Serial configuration')
+  .option('--timeout <seconds>', 'Test timeout in seconds', '10')
+  .action(async (options) => {
+    const testScript = path.join(__dirname, '..', 'scripts', 'test-connection.js');
+    
+    const args = [];
+    if (options.config) args.push('--config', options.config);
+    if (options.tcp) args.push('--tcp');
+    if (options.serial) args.push('--serial');
+    if (options.timeout) args.push('--timeout', options.timeout);
+    
+    spawn('node', [testScript, ...args], {
+      stdio: 'inherit'
+    });
+  });
+
+// Dashboard command - run both relay service and dashboard
+program
+  .command('dashboard')
+  .description('Start the relay service with web dashboard')
+  .option('-c, --config <path>', 'Configuration file path')
+  .option('-p, --port <port>', 'Dashboard port', '3000')
+  .option('--mock', 'Run in mock mode for testing')
+  .option('--debug', 'Enable debug logging')
+  .action(async (options) => {
+    const appPath = path.join(__dirname, '..', 'src', 'app.js');
+    const dashboardPath = path.join(__dirname, '..', 'dashboard');
+    const env = { ...process.env };
+    
+    if (options.config) {
+      env.CONFIG_PATH = options.config;
+    }
+    
+    if (options.mock) {
+      env.MOCK_ENV = 'true';
+      env.LOG_LEVEL = 'debug';
+    }
+    
+    if (options.debug) {
+      env.LOG_LEVEL = 'debug';
+    }
+    
+    // Set dashboard port
+    env.PORT = options.port;
+    
+    console.log('Starting TCP-Serial/TCP Relay service...');
+    // Start the relay service as a background process
+    const relayProcess = spawn('node', [appPath], {
+      detached: true,
+      stdio: 'ignore',
+      env
+    });
+    relayProcess.unref();
+    console.log(`Relay service started with PID: ${relayProcess.pid}`);
+    
+    console.log('Installing dashboard dependencies...');
+    try {
+      // Install dashboard dependencies
+      execSync('npm install', {
+        cwd: dashboardPath,
+        stdio: 'inherit'
+      });
+      
+      console.log(`Starting dashboard on port ${options.port}...`);
+      console.log('Press Ctrl+C to stop both the relay service and dashboard');
+      
+      // Start the simple dashboard server
+      const dashboardProcess = spawn('node', ['server.js'], {
+        cwd: dashboardPath,
+        stdio: 'inherit',
+        env
+      });
+      
+      // Handle dashboard process exit
+      dashboardProcess.on('exit', (code) => {
+        console.log(`Dashboard exited with code ${code}`);
+        // Also stop the relay service when dashboard is stopped
+        try {
+          process.kill(relayProcess.pid, 'SIGTERM');
+          console.log(`Stopped relay service with PID: ${relayProcess.pid}`);
+        } catch (error) {
+          console.warn(`Could not stop relay service: ${error.message}`);
+        }
+        process.exit(code);
+      });
+      
+      // Handle SIGINT (Ctrl+C) to gracefully shut down both processes
+      process.on('SIGINT', () => {
+        console.log('\nShutting down relay service and dashboard...');
+        try {
+          process.kill(relayProcess.pid, 'SIGTERM');
+          console.log(`Stopped relay service with PID: ${relayProcess.pid}`);
+        } catch (error) {
+          console.warn(`Could not stop relay service: ${error.message}`);
+        }
+        dashboardProcess.kill();
+        process.exit(0);
+      });
+    } catch (error) {
+      console.error('Error installing dashboard dependencies:', error.message);
+      // Stop the relay service if dashboard fails to start
+      try {
+        process.kill(relayProcess.pid, 'SIGTERM');
+        console.log(`Stopped relay service with PID: ${relayProcess.pid}`);
+      } catch (err) {
+        console.warn(`Could not stop relay service: ${err.message}`);
+      }
+      process.exit(1);
     }
   });
 

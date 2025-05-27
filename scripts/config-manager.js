@@ -7,18 +7,23 @@ const path = require('path');
 const { spawn } = require('child_process');
 const { program } = require('commander');
 
+// Import the config path resolver
+const { getConfigPath } = require('../src/config');
+
 class ConfigManager {
   constructor() {
-    this.configPath = process.env.CONFIG_PATH || '/etc/tcp-serial-relay/relay-config.json';
+    this.configPath = getConfigPath(); // Use the same path resolution as the main app
     this.defaultConfigPath = path.join(__dirname, '..', 'src', 'config', 'default-config.js');
   }
 
   show() {
     console.log('Current Configuration:');
     console.log('====================');
+    console.log(`Configuration file: ${this.configPath}`);
+    console.log('');
     
     if (!fs.existsSync(this.configPath)) {
-      console.log('❌ Configuration file not found:', this.configPath);
+      console.log('❌ Configuration file not found');
       console.log('Run "tcp-serial-relay config --reset" to create default configuration');
       return;
     }
@@ -26,7 +31,6 @@ class ConfigManager {
     try {
       const config = JSON.parse(fs.readFileSync(this.configPath, 'utf8'));
       console.log(JSON.stringify(config, null, 2));
-      console.log('\nConfiguration file:', this.configPath);
     } catch (error) {
       console.error('❌ Error reading configuration:', error.message);
     }
@@ -40,6 +44,7 @@ class ConfigManager {
 
     const editor = process.env.EDITOR || 'nano';
     console.log(`Opening configuration file with ${editor}...`);
+    console.log(`File: ${this.configPath}`);
     
     const child = spawn(editor, [this.configPath], {
       stdio: 'inherit'
@@ -82,31 +87,55 @@ class ConfigManager {
           message: 'TCP port must be an integer between 1 and 65535'
         },
         {
-          field: 'serialPath',
-          test: (val) => typeof val === 'string' && val.length > 0,
-          message: 'Serial path must be a non-empty string'
-        },
-        {
-          field: 'serialBaud',
-          test: (val) => Number.isInteger(val) && val > 0,
-          message: 'Serial baud rate must be a positive integer'
-        },
-        {
-          field: 'serialParity',
-          test: (val) => ['none', 'even', 'odd', 'mark', 'space'].includes(val),
-          message: 'Serial parity must be one of: none, even, odd, mark, space'
-        },
-        {
-          field: 'serialDataBits',
-          test: (val) => [5, 6, 7, 8].includes(val),
-          message: 'Serial data bits must be 5, 6, 7, or 8'
-        },
-        {
-          field: 'serialStopBits',
-          test: (val) => [1, 1.5, 2].includes(val),
-          message: 'Serial stop bits must be 1, 1.5, or 2'
+          field: 'connectionType',
+          test: (val) => ['serial', 'tcp'].includes(val),
+          message: 'Connection type must be "serial" or "tcp"'
         }
       ];
+
+      // Connection-specific validations
+      if (config.connectionType === 'serial') {
+        validations.push(
+          {
+            field: 'serialPath',
+            test: (val) => typeof val === 'string' && val.length > 0,
+            message: 'Serial path must be a non-empty string'
+          },
+          {
+            field: 'serialBaud',
+            test: (val) => Number.isInteger(val) && val > 0,
+            message: 'Serial baud rate must be a positive integer'
+          },
+          {
+            field: 'serialParity',
+            test: (val) => ['none', 'even', 'odd', 'mark', 'space'].includes(val),
+            message: 'Serial parity must be one of: none, even, odd, mark, space'
+          },
+          {
+            field: 'serialDataBits',
+            test: (val) => [5, 6, 7, 8].includes(val),
+            message: 'Serial data bits must be 5, 6, 7, or 8'
+          },
+          {
+            field: 'serialStopBits',
+            test: (val) => [1, 1.5, 2].includes(val),
+            message: 'Serial stop bits must be 1, 1.5, or 2'
+          }
+        );
+      } else if (config.connectionType === 'tcp') {
+        validations.push(
+          {
+            field: 'secondaryTcpIp',
+            test: (val) => typeof val === 'string' && val.length > 0,
+            message: 'Secondary TCP IP must be a non-empty string'
+          },
+          {
+            field: 'secondaryTcpPort',
+            test: (val) => Number.isInteger(val) && val >= 1 && val <= 65535,
+            message: 'Secondary TCP port must be an integer between 1 and 65535'
+          }
+        );
+      }
 
       let isValid = true;
       const errors = [];
@@ -121,12 +150,27 @@ class ConfigManager {
         }
       }
 
+      // Check for port conflicts in TCP mode
+      if (config.connectionType === 'tcp' && 
+          config.tcpIp === config.secondaryTcpIp && 
+          config.tcpPort === config.secondaryTcpPort) {
+        errors.push('Primary and secondary TCP endpoints cannot be the same');
+        isValid = false;
+      }
+
       if (isValid) {
         console.log('✅ Configuration is valid');
         console.log('\nConfiguration Summary:');
-        console.log(`  TCP Endpoint: ${config.tcpIp}:${config.tcpPort}`);
-        console.log(`  Serial Port: ${config.serialPath} @ ${config.serialBaud} baud`);
-        console.log(`  Serial Settings: ${config.serialDataBits}${config.serialParity.charAt(0).toUpperCase()}${config.serialStopBits}`);
+        console.log(`  Connection Type: ${config.connectionType}`);
+        console.log(`  Primary TCP: ${config.tcpIp}:${config.tcpPort}`);
+        
+        if (config.connectionType === 'serial') {
+          console.log(`  Serial Port: ${config.serialPath} @ ${config.serialBaud} baud`);
+          console.log(`  Serial Settings: ${config.serialDataBits}${config.serialParity.charAt(0).toUpperCase()}${config.serialStopBits}`);
+        } else if (config.connectionType === 'tcp') {
+          console.log(`  Secondary TCP: ${config.secondaryTcpIp}:${config.secondaryTcpPort}`);
+        }
+        
         console.log(`  Log Level: ${config.logLevel || 'info'}`);
         return true;
       } else {
@@ -143,25 +187,28 @@ class ConfigManager {
 
   reset() {
     console.log('Resetting configuration to defaults...');
+    console.log(`Target file: ${this.configPath}`);
     
     try {
       // Load default configuration
+      delete require.cache[require.resolve(this.defaultConfigPath)];
       const defaultConfig = require(this.defaultConfigPath);
       
       // Ensure config directory exists
       const configDir = path.dirname(this.configPath);
       if (!fs.existsSync(configDir)) {
         fs.mkdirSync(configDir, { recursive: true });
+        console.log(`Created directory: ${configDir}`);
       }
 
       // Write default configuration
       fs.writeFileSync(this.configPath, JSON.stringify(defaultConfig, null, 2), 'utf8');
       
       console.log('✅ Default configuration created');
-      console.log('File:', this.configPath);
       console.log('\nNext steps:');
       console.log('1. Edit the configuration: tcp-serial-relay config --edit');
       console.log('2. Validate: tcp-serial-relay config --validate');
+      console.log('3. Test connections: tcp-serial-relay test');
 
     } catch (error) {
       console.error('❌ Failed to reset configuration:', error.message);
@@ -243,52 +290,108 @@ class ConfigManager {
     }
   }
 
+  info() {
+    console.log('Configuration Information:');
+    console.log('=========================');
+    console.log(`Config path: ${this.configPath}`);
+    console.log(`Config exists: ${fs.existsSync(this.configPath) ? 'Yes' : 'No'}`);
+    
+    if (fs.existsSync(this.configPath)) {
+      const stats = fs.statSync(this.configPath);
+      console.log(`Last modified: ${stats.mtime.toISOString()}`);
+      console.log(`File size: ${stats.size} bytes`);
+    }
+    
+    console.log(`Default config: ${this.defaultConfigPath}`);
+    console.log('');
+    
+    // Show environment variables that affect config
+    const envVars = [
+      'CONFIG_PATH',
+      'TCP_IP',
+      'TCP_PORT',
+      'CONNECTION_TYPE',
+      'SERIAL_PATH',
+      'SERIAL_BAUD',
+      'SECONDARY_TCP_IP',
+      'SECONDARY_TCP_PORT'
+    ];
+    
+    const setVars = envVars.filter(name => process.env[name]);
+    if (setVars.length > 0) {
+      console.log('Environment overrides:');
+      setVars.forEach(name => {
+        console.log(`  ${name}=${process.env[name]}`);
+      });
+    } else {
+      console.log('No environment variable overrides set');
+    }
+  }
+
   template() {
     const template = {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "TCP-Serial Relay Configuration",
+      "title": "TCP-Serial/TCP Relay Configuration",
       "type": "object",
       "properties": {
+        "connectionType": {
+          "type": "string",
+          "enum": ["serial", "tcp"],
+          "description": "Type of secondary connection",
+          "default": "serial"
+        },
         "tcpIp": {
           "type": "string",
-          "description": "TCP server IP address",
+          "description": "Primary TCP server IP address",
           "default": "192.168.1.90"
         },
         "tcpPort": {
           "type": "integer",
           "minimum": 1,
           "maximum": 65535,
-          "description": "TCP server port",
+          "description": "Primary TCP server port",
           "default": 10002
         },
         "serialPath": {
           "type": "string",
-          "description": "Serial port device path",
+          "description": "Serial port device path (when connectionType is 'serial')",
           "default": "/dev/ttyUSB0"
         },
         "serialBaud": {
           "type": "integer",
           "minimum": 1,
-          "description": "Serial port baud rate",
+          "description": "Serial port baud rate (when connectionType is 'serial')",
           "default": 9600
         },
         "serialParity": {
           "type": "string",
           "enum": ["none", "even", "odd", "mark", "space"],
-          "description": "Serial port parity",
+          "description": "Serial port parity (when connectionType is 'serial')",
           "default": "odd"
         },
         "serialDataBits": {
           "type": "integer",
           "enum": [5, 6, 7, 8],
-          "description": "Serial port data bits",
+          "description": "Serial port data bits (when connectionType is 'serial')",
           "default": 7
         },
         "serialStopBits": {
           "type": "number",
           "enum": [1, 1.5, 2],
-          "description": "Serial port stop bits",
+          "description": "Serial port stop bits (when connectionType is 'serial')",
           "default": 1
+        },
+        "secondaryTcpIp": {
+          "type": "string",
+          "description": "Secondary TCP server IP address (when connectionType is 'tcp')",
+          "default": "192.168.1.91"
+        },
+        "secondaryTcpPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Secondary TCP server port (when connectionType is 'tcp')",
+          "default": 10003
         },
         "maxRetries": {
           "type": "integer",
@@ -327,14 +430,19 @@ class ConfigManager {
         }
       },
       "required": [
+        "connectionType",
         "tcpIp",
-        "tcpPort", 
-        "serialPath",
-        "serialBaud",
-        "serialParity",
-        "serialDataBits",
-        "serialStopBits"
-      ]
+        "tcpPort"
+      ],
+      "if": {
+        "properties": { "connectionType": { "const": "serial" } }
+      },
+      "then": {
+        "required": ["serialPath", "serialBaud", "serialParity", "serialDataBits", "serialStopBits"]
+      },
+      "else": {
+        "required": ["secondaryTcpIp", "secondaryTcpPort"]
+      }
     };
 
     console.log('Configuration Template:');
@@ -346,7 +454,7 @@ class ConfigManager {
 // CLI setup
 program
   .name('config-manager')
-  .description('TCP-Serial Relay configuration management')
+  .description('TCP-Serial/TCP Relay configuration management')
   .version('1.0.0');
 
 program
@@ -356,6 +464,7 @@ program
   .option('--reset', 'Reset to default configuration')
   .option('--backup', 'Backup current configuration')
   .option('--restore <file>', 'Restore from backup file')
+  .option('--info', 'Show configuration file information')
   .option('--template', 'Show configuration template/schema')
   .action((options) => {
     const manager = new ConfigManager();
@@ -373,6 +482,8 @@ program
       manager.backup();
     } else if (options.restore) {
       manager.restore(options.restore);
+    } else if (options.info) {
+      manager.info();
     } else if (options.template) {
       manager.template();
     } else {

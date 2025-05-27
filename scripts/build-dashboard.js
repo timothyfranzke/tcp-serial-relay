@@ -5,37 +5,88 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 
 console.log('Building TCP-Serial Relay Dashboard...');
 
-// Create dashboard directory
+// Path to the dashboard directory
 const dashboardDir = path.join(__dirname, '../dashboard');
+
+// Check if dashboard directory exists
 if (!fs.existsSync(dashboardDir)) {
-  fs.mkdirSync(dashboardDir, { recursive: true });
+  console.error('Dashboard directory not found. Make sure the dashboard directory exists at:', dashboardDir);
+  process.exit(1);
 }
 
-// Dashboard HTML content with real WebSocket integration
-const dashboardHtml = `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TCP-Serial Relay Dashboard</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+try {
+  // Navigate to the dashboard directory and build the Next.js app
+  console.log('Installing dashboard dependencies...');
+  execSync('npm install', { cwd: dashboardDir, stdio: 'inherit' });
+  
+  console.log('Building Next.js dashboard...');
+  execSync('npm run build', { cwd: dashboardDir, stdio: 'inherit' });
+  
+  console.log('Dashboard built successfully!');
+  
+  // Create a .npmignore file to ensure the built dashboard is included in the package
+  const npmignorePath = path.join(__dirname, '../.npmignore');
+  let npmignoreContent = '';
+  
+  // Read existing .npmignore if it exists
+  if (fs.existsSync(npmignorePath)) {
+    npmignoreContent = fs.readFileSync(npmignorePath, 'utf8');
+  }
+  
+  // Make sure we're not ignoring the dashboard build output
+  const linesToEnsure = [
+    '# Include dashboard build output',
+    '!dashboard/.next/standalone/**',
+    '!dashboard/.next/static/**',
+    '!dashboard/public/**'
+  ];
+  
+  let modified = false;
+  for (const line of linesToEnsure) {
+    if (!npmignoreContent.includes(line)) {
+      npmignoreContent += '\n' + line;
+      modified = true;
+    }
+  }
+  
+  if (modified) {
+    fs.writeFileSync(npmignorePath, npmignoreContent);
+    console.log('Updated .npmignore to include dashboard build output');
+  }
+  
+  // Create a README for the dashboard
+  const readmePath = path.join(dashboardDir, 'README.md');
+  const readmeContent = `# TCP-Serial Relay Dashboard
 
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            color: #333;
-        }
+This is the web dashboard for the TCP-Serial Relay package. It provides a user-friendly interface for monitoring and configuring the relay service.
 
-        .container {
+## Usage
+
+The dashboard can be started along with the relay service using:
+
+\`\`\`bash
+tcp-serial-relay dashboard
+\`\`\`
+
+For more options, run:
+
+\`\`\`bash
+tcp-serial-relay dashboard --help
+\`\`\`
+`;
+  
+  fs.writeFileSync(readmePath, readmeContent);
+  console.log('Created dashboard README');
+  
+  console.log('Dashboard build process completed successfully!');
+} catch (error) {
+  console.error('Error building dashboard:', error);
+  process.exit(1);
+}
             max-width: 1400px;
             margin: 0 auto;
             padding: 20px;
