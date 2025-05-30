@@ -1,4 +1,4 @@
-// src/app.js
+// src/app.js - Enhanced version with proper error handling and status reporting
 require('dotenv').config();
 
 const { logger } = require('./utils/logger');
@@ -8,17 +8,18 @@ const { getDeviceInfo } = require('./utils/device-info');
 const RelayService = require('./services/relay-service');
 
 /**
- * Main application class
+ * Main application class with enhanced error handling
  */
 class TcpSerialRelayApp {
   constructor() {
     this.config = null;
     this.relayService = null;
     this.startTime = new Date();
+    this.initializationCompleted = false;
   }
 
   /**
-   * Initialize and run the application
+   * Initialize and run the application with comprehensive error handling
    */
   async run() {
     try {
@@ -30,35 +31,41 @@ class TcpSerialRelayApp {
         deviceInfo: getDeviceInfo()
       });
 
-      // Load configuration
-      await this.loadConfiguration();
+      // Load configuration with error handling
+      await this.safeLoadConfiguration();
 
       // Log connection mode
       const connectionMode = this.config.connectionType === 'tcp' ? 'TCP-to-TCP' : 'TCP-to-Serial';
       logger.info(`Operating in ${connectionMode} relay mode`);
 
-      // Initialize relay service
-      await this.initializeRelayService();
+      // Initialize relay service with error handling
+      await this.safeInitializeRelayService();
 
       // Setup shutdown handler
       this.setupShutdownHandler();
 
-      // Start the relay service
-      await this.startRelayService();
+      // Start the relay service with error handling
+      await this.safeStartRelayService();
+
+      // Mark initialization as completed
+      this.initializationCompleted = true;
 
     } catch (error) {
       logger.error('Application startup failed', { 
         error: error.message,
-        stack: error.stack 
+        stack: error.stack,
+        initializationCompleted: this.initializationCompleted
       });
-      await shutdown(false, `Startup failed: ${error.message}`, 1);
+      
+      // Ensure status is sent even on startup failure
+      await this.handleFatalError(error, 'Startup failed');
     }
   }
 
   /**
-   * Load and validate configuration
+   * Safely load configuration with proper error handling
    */
-  async loadConfiguration() {
+  async safeLoadConfiguration() {
     logger.info('Loading application configuration...');
     updateStatus({ message: 'Loading configuration...' });
 
@@ -85,15 +92,20 @@ class TcpSerialRelayApp {
       }
 
       logger.info('Configuration loaded successfully', logData);
+      updateStatus({ message: 'Configuration loaded successfully' });
+      
     } catch (error) {
-      throw new Error(`Configuration loading failed: ${error.message}`);
+      const configError = new Error(`Configuration loading failed: ${error.message}`);
+      configError.originalError = error;
+      configError.phase = 'configuration';
+      throw configError;
     }
   }
 
   /**
-   * Initialize the relay service
+   * Safely initialize the relay service with proper error handling
    */
-  async initializeRelayService() {
+  async safeInitializeRelayService() {
     logger.info('Initializing relay service...');
     updateStatus({ message: 'Initializing relay service...' });
 
@@ -101,8 +113,71 @@ class TcpSerialRelayApp {
       this.relayService = new RelayService(this.config);
       this.setupRelayEventHandlers();
       logger.info('Relay service initialized successfully');
+      updateStatus({ message: 'Relay service initialized successfully' });
+      
     } catch (error) {
-      throw new Error(`Relay service initialization failed: ${error.message}`);
+      const serviceError = new Error(`Relay service initialization failed: ${error.message}`);
+      serviceError.originalError = error;
+      serviceError.phase = 'service_initialization';
+      throw serviceError;
+    }
+  }
+
+  /**
+   * Safely start the relay service with proper error handling
+   */
+  async safeStartRelayService() {
+    logger.info('Starting relay service...');
+    updateStatus({ message: 'Starting relay service...' });
+
+    try {
+      await this.relayService.start();
+      logger.info('Application initialization completed successfully');
+      updateStatus({ message: 'Relay service started successfully - waiting for connections' });
+      
+    } catch (error) {
+      const startError = new Error(`Failed to start relay service: ${error.message}`);
+      startError.originalError = error;
+      startError.phase = 'service_startup';
+      throw startError;
+    }
+  }
+
+  /**
+   * Handle fatal errors with proper status reporting
+   */
+  async handleFatalError(error, context = 'Unknown error') {
+    try {
+      const errorMessage = `${context}: ${error.message}`;
+      const errorDetails = {
+        error: error.message,
+        stack: error.stack,
+        phase: error.phase || 'unknown',
+        originalError: error.originalError?.message,
+        initializationCompleted: this.initializationCompleted,
+        context: context
+      };
+
+      logger.error('Fatal application error', errorDetails);
+      
+      // Update status with error information
+      updateStatus({ 
+        message: errorMessage,
+        error: errorDetails,
+        success: false
+      });
+
+      // Force shutdown with status reporting
+      await shutdown(false, errorMessage, 1);
+      
+    } catch (shutdownError) {
+      logger.error('Error during fatal error handling', { 
+        shutdownError: shutdownError.message,
+        originalError: error.message 
+      });
+      
+      // Last resort: exit with error code
+      process.exit(1);
     }
   }
 
@@ -122,18 +197,25 @@ class TcpSerialRelayApp {
 
     // Data successfully relayed
     this.relayService.on('dataRelayed', (info) => {
-      logger.info('Data relayed successfully to TCP', info);
+      logger.info('Data relayed successfully', info);
       // Update metrics are handled in RelayService
     });
 
     // Relay error occurred
     this.relayService.on('relayError', (info) => {
       logger.error('Data relay error', info);
+      // Don't exit on relay errors, let the service handle recovery
     });
 
     // Client disconnected
     this.relayService.on('clientDisconnected', (info) => {
       logger.warn(`${info.clientName} client disconnected`, info);
+    });
+
+    // Service errors that should trigger shutdown
+    this.relayService.on('error', async (error) => {
+      logger.error('Relay service error', { error: error.message, stack: error.stack });
+      await this.handleFatalError(error, 'Relay service error');
     });
 
     // Relay completed successfully
@@ -151,7 +233,11 @@ class TcpSerialRelayApp {
     // Relay stopped (usually due to disconnection)
     this.relayService.on('stopped', async (result) => {
       logger.info('Relay service stopped', result);
-      await shutdown(result.success, result.stats ? 'Service stopped after operation' : 'Service stopped unexpectedly', 0);
+      await shutdown(
+        result.success, 
+        result.stats ? 'Service stopped after operation' : 'Service stopped unexpectedly', 
+        0
+      );
     });
   }
 
@@ -173,26 +259,12 @@ class TcpSerialRelayApp {
   }
 
   /**
-   * Start the relay service
-   */
-  async startRelayService() {
-    logger.info('Starting relay service...');
-    updateStatus({ message: 'Starting relay service...' });
-
-    try {
-      await this.relayService.start();
-      logger.info('Application initialization completed successfully');
-    } catch (error) {
-      throw new Error(`Failed to start relay service: ${error.message}`);
-    }
-  }
-
-  /**
    * Get application health status
    */
   getHealthStatus() {
     return {
       uptime: Date.now() - this.startTime.getTime(),
+      initializationCompleted: this.initializationCompleted,
       relayService: this.relayService?.getHealthStatus() || null,
       config: this.config ? {
         connectionType: this.config.connectionType,
@@ -208,38 +280,97 @@ class TcpSerialRelayApp {
   }
 }
 
-
-
 /**
- * Main entry point
+ * Enhanced main entry point with comprehensive error handling
  */
 async function main() {
   const app = new TcpSerialRelayApp();
-  await app.run();
+  
+  try {
+    await app.run();
+  } catch (error) {
+    // This catch should not be reached due to handleFatalError in run()
+    // But it's a safety net for any unexpected errors
+    logger.error('Unexpected error in main()', { 
+      error: error.message, 
+      stack: error.stack 
+    });
+    
+    try {
+      await shutdown(false, `Fatal error: ${error.message}`, 1);
+    } catch (shutdownError) {
+      logger.error('Failed to shutdown gracefully', { error: shutdownError.message });
+      process.exit(1);
+    }
+  }
 }
 
-// Handle unhandled promise rejections and exceptions at the module level
-process.on('unhandledRejection', (reason, promise) => {
+// Enhanced global error handlers that ensure status reporting
+process.on('unhandledRejection', async (reason, promise) => {
+  const errorMessage = reason instanceof Error ? reason.message : String(reason);
+  const errorStack = reason instanceof Error ? reason.stack : undefined;
+  
   logger.error('Unhandled Promise Rejection', {
-    reason: reason instanceof Error ? reason.message : reason,
-    stack: reason instanceof Error ? reason.stack : undefined,
+    reason: errorMessage,
+    stack: errorStack,
     promise: promise.toString()
   });
+  
+  try {
+    updateStatus({ 
+      message: `Unhandled promise rejection: ${errorMessage}`,
+      error: { reason: errorMessage, stack: errorStack },
+      success: false
+    });
+    
+    await shutdown(false, `Unhandled rejection: ${errorMessage}`, 1);
+  } catch (shutdownError) {
+    logger.error('Failed to handle unhandled rejection gracefully', { error: shutdownError.message });
+    process.exit(1);
+  }
 });
 
-process.on('uncaughtException', (error) => {
+process.on('uncaughtException', async (error) => {
   logger.error('Uncaught Exception', {
     error: error.message,
     stack: error.stack
   });
-  process.exit(1);
+  
+  try {
+    updateStatus({ 
+      message: `Uncaught exception: ${error.message}`,
+      error: { message: error.message, stack: error.stack },
+      success: false
+    });
+    
+    await shutdown(false, `Uncaught exception: ${error.message}`, 1);
+  } catch (shutdownError) {
+    logger.error('Failed to handle uncaught exception gracefully', { error: shutdownError.message });
+    process.exit(1);
+  }
+});
+
+// Enhanced warning handler for potential issues
+process.on('warning', (warning) => {
+  logger.warn('Process warning', {
+    name: warning.name,
+    message: warning.message,
+    stack: warning.stack
+  });
 });
 
 // Run the application if this file is executed directly
 if (require.main === module) {
-  main().catch((error) => {
-    console.error('Fatal application error:', error);
-    process.exit(1);
+  main().catch(async (error) => {
+    console.error('Fatal application error (final catch):', error);
+    
+    try {
+      // Last ditch effort to send status
+      await shutdown(false, `Final catch: ${error.message}`, 1);
+    } catch (finalError) {
+      console.error('Complete failure:', finalError);
+      process.exit(1);
+    }
   });
 }
 

@@ -96,82 +96,111 @@ class SerialClient extends EventEmitter {
    * Attempt a single connection
    * @returns {Promise} Promise that resolves when connected
    */
-  attemptConnection() {
-    return new Promise((resolve, reject) => {
-      this.isConnecting = true;
-      this.lastError = null;
+  // src/services/serial-client.js - Enhanced error handling section
+// Add this method to the SerialClient class:
+
+/**
+ * Enhanced connection attempt with better error propagation
+ */
+attemptConnection() {
+  return new Promise((resolve, reject) => {
+    this.isConnecting = true;
+    this.lastError = null;
+    
+    try {
+      // Create new SerialPort instance
+      this.port = new this.SerialPort({
+        path: this.config.serialPath,
+        baudRate: this.config.serialBaud,
+        parity: this.config.serialParity,
+        dataBits: this.config.serialDataBits,
+        stopBits: this.config.serialStopBits,
+        autoOpen: false
+      });
+    } catch (error) {
+      this.handleConnectionError(error);
+      // CRITICAL: Reject the promise instead of just emitting
+      reject(error);
+      return;
+    }
+    
+    // Connection success handler
+    this.port.on('open', () => {
+      this.isConnected = true;
+      this.isConnecting = false;
       
-      try {
-        // Create new SerialPort instance
-        this.port = new this.SerialPort({
-          path: this.config.serialPath,
-          baudRate: this.config.serialBaud,
+      logger.info('Serial port opened successfully', {
+        path: this.config.serialPath,
+        baudRate: this.config.serialBaud,
+        settings: {
           parity: this.config.serialParity,
           dataBits: this.config.serialDataBits,
-          stopBits: this.config.serialStopBits,
-          autoOpen: false
-        });
-      } catch (error) {
-        this.handleConnectionError(error);
-        reject(error);
-        return;
-      }
-      
-      // Connection success handler
-      this.port.on('open', () => {
-        this.isConnected = true;
-        this.isConnecting = false;
-        
-        logger.info('Serial port opened successfully', {
-          path: this.config.serialPath,
-          baudRate: this.config.serialBaud,
-          settings: {
-            parity: this.config.serialParity,
-            dataBits: this.config.serialDataBits,
-            stopBits: this.config.serialStopBits
-          },
-          attempts: this.connectionAttempts
-        });
-        
-        this.emit('connected', {
-          path: this.config.serialPath,
-          baudRate: this.config.serialBaud,
-          attempts: this.connectionAttempts
-        });
-        
-        resolve();
+          stopBits: this.config.serialStopBits
+        },
+        attempts: this.connectionAttempts
       });
       
-      // Data received handler
-      this.port.on('data', (data) => {
-        this.handleIncomingData(data);
+      this.emit('connected', {
+        path: this.config.serialPath,
+        baudRate: this.config.serialBaud,
+        attempts: this.connectionAttempts
       });
       
-      // Error handler
-      this.port.on('error', (error) => {
-        this.handleConnectionError(error);
-        reject(error);
+      resolve();
+    });
+    
+    // Data received handler
+    this.port.on('data', (data) => {
+      this.handleIncomingData(data);
+    });
+    
+    // ENHANCED: Better error handling that always rejects
+    this.port.on('error', (error) => {
+      this.handleConnectionError(error);
+      
+      // Emit for event listeners AND reject for promise chain
+      this.emit('error', {
+        error: error.message,
+        code: error.code,
+        retryable: this.isRetryableError(error),
+        phase: 'connection'
       });
       
-      // Close handler
-      this.port.on('close', (hadError) => {
-        this.handleDisconnection(hadError);
-      });
-      
-      // Attempt to open the port
-      try {
-        this.port.open((error) => {
-          if (error) {
-            this.handleConnectionError(error);
-            reject(error);
-          }
-        });
-      } catch (error) {
-        this.handleConnectionError(error);
+      // CRITICAL: Always reject on error during connection attempt
+      if (this.isConnecting) {
         reject(error);
       }
     });
-  }
+    
+    // Close handler
+    this.port.on('close', (hadError) => {
+      this.handleDisconnection(hadError);
+    });
+    
+    // Attempt to open the port with timeout
+    const connectionTimeout = setTimeout(() => {
+      const timeoutError = new Error(`Serial connection timeout after ${this.config.connectionTimeout || 10000}ms`);
+      this.handleConnectionError(timeoutError);
+      reject(timeoutError);
+    }, this.config.connectionTimeout || 10000);
+    
+    try {
+      this.port.open((error) => {
+        clearTimeout(connectionTimeout);
+        
+        if (error) {
+          this.handleConnectionError(error);
+          reject(error);
+        }
+        // Success is handled by the 'open' event
+      });
+    } catch (error) {
+      clearTimeout(connectionTimeout);
+      this.handleConnectionError(error);
+      reject(error);
+    }
+  });
+}
 
   /**
    * Enhanced error handling to prevent uncaught exceptions

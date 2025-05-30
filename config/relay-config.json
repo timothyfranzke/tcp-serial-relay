@@ -16,6 +16,6 @@
   "bufferSize": 1024,
   "logDataTransfers": true,
   "logLevel": "info",
-  "collectData": true,
-  "collectLogs": true
+  "collectLogs": false,
+  "collectData": false
 }

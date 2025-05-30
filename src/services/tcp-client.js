@@ -62,72 +62,95 @@ class TcpClient extends EventEmitter {
    * Attempt a single connection
    * @returns {Promise} Promise that resolves when connected
    */
-  attemptConnection() {
-    return new Promise((resolve, reject) => {
-      this.isConnecting = true;
-      this.lastError = null;
+  // src/services/tcp-client.js - Enhanced error handling section
+// Replace the existing attemptConnection method with this:
+
+/**
+ * Attempt a single connection with enhanced error handling
+ */
+attemptConnection() {
+  return new Promise((resolve, reject) => {
+    this.isConnecting = true;
+    this.lastError = null;
+    
+    // Create new socket
+    this.socket = new net.Socket();
+    
+    // Set connection timeout
+    const timeoutMs = this.config.connectionTimeout || 10000;
+    this.socket.setTimeout(timeoutMs);
+    
+    // ENHANCED: Set up error handler BEFORE attempting connection
+    this.socket.on('error', (error) => {
+      this.handleConnectionError(error);
       
-      // Create new socket
-      this.socket = new net.Socket();
-      
-      // Set connection timeout
-      this.socket.setTimeout(this.config.connectionTimeout || 10000);
-      
-      // Connection success handler
-      this.socket.on('connect', () => {
-        this.isConnected = true;
-        this.isConnecting = false;
-        this.socket.setTimeout(0); // Disable timeout once connected
-        
-        logger.info('TCP connection established', {
-          host: this.config.tcpIp,
-          port: this.config.tcpPort,
-          localAddress: this.socket.localAddress,
-          localPort: this.socket.localPort,
-          attempts: this.connectionAttempts
-        });
-        
-        this.emit('connected', {
-          host: this.config.tcpIp,
-          port: this.config.tcpPort,
-          attempts: this.connectionAttempts
-        });
-        
-        resolve();
+      // Emit for event listeners
+      this.emit('error', {
+        error: error.message,
+        code: error.code,
+        retryable: this.isRetryableError(error),
+        phase: 'connection'
       });
       
-      // Connection timeout handler
-      this.socket.on('timeout', () => {
-        const error = new Error(`TCP connection timeout to ${this.config.tcpIp}:${this.config.tcpPort}`);
-        this.handleConnectionError(error);
-        reject(error);
-      });
-      
-      // Connection error handler - Enhanced to prevent uncaught exceptions
-      this.socket.on('error', (error) => {
-        this.handleConnectionError(error);
-        reject(error);
-      });
-      
-      // Data received handler
-      this.socket.on('data', (data) => {
-        this.handleIncomingData(data);
-      });
-      
-      // Connection close handler
-      this.socket.on('close', (hadError) => {
-        this.handleDisconnection(hadError);
-      });
-      
-      // Attempt connection
-      try {
-        this.socket.connect(this.config.tcpPort, this.config.tcpIp);
-      } catch (error) {
-        this.handleConnectionError(error);
+      // CRITICAL: Always reject during connection attempt
+      if (this.isConnecting) {
         reject(error);
       }
     });
-  }
+    
+    // Connection timeout handler
+    this.socket.on('timeout', () => {
+      const error = new Error(`TCP connection timeout to ${this.config.tcpIp}:${this.config.tcpPort} after ${timeoutMs}ms`);
+      this.handleConnectionError(error);
+      
+      // CRITICAL: Reject the promise
+      reject(error);
+    });
+    
+    // Connection success handler
+    this.socket.on('connect', () => {
+      this.isConnected = true;
+      this.isConnecting = false;
+      this.socket.setTimeout(0); // Disable timeout once connected
+      
+      logger.info('TCP connection established', {
+        host: this.config.tcpIp,
+        port: this.config.tcpPort,
+        localAddress: this.socket.localAddress,
+        localPort: this.socket.localPort,
+        attempts: this.connectionAttempts
+      });
+      
+      this.emit('connected', {
+        host: this.config.tcpIp,
+        port: this.config.tcpPort,
+        attempts: this.connectionAttempts
+      });
+      
+      resolve();
+    });
+    
+    // Data received handler
+    this.socket.on('data', (data) => {
+      this.handleIncomingData(data);
+    });
+    
+    // Connection close handler
+    this.socket.on('close', (hadError) => {
+      this.handleDisconnection(hadError);
+    });
+    
+    // ENHANCED: Wrap connection attempt in try-catch
+    try {
+      this.socket.connect(this.config.tcpPort, this.config.tcpIp);
+    } catch (error) {
+      this.handleConnectionError(error);
+      
+      // CRITICAL: Reject immediately on synchronous errors
+      reject(error);
+    }
+  });
+}
 
   /**
    * Enhanced error handling to prevent uncaught exceptions
