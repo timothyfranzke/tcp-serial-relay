@@ -1,6 +1,8 @@
 const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
+const https = require('https');
+const os = require('os');
 
 // Function to check and update a global npm package
 async function checkAndUpdatePackage(packageName) {
@@ -33,6 +35,10 @@ async function checkAndUpdatePackage(packageName) {
       console.log(`Updating ${packageName} to version ${latestVersion}...`);
       await execPromise(`npm install -g ${packageName}@${latestVersion}`);
       console.log(`${packageName} successfully updated to version ${latestVersion}`);
+      
+      // Send update information to the endpoint
+      const deviceId = os.hostname();
+      await reportVersionUpdate(deviceId, latestVersion);
     } else {
       console.log(`${packageName} is already up to date or not installed globally.`);
     }
@@ -51,6 +57,45 @@ async function main() {
   }
 
   await checkAndUpdatePackage(packageName);
+}
+
+// Function to report version update to the endpoint
+async function reportVersionUpdate(deviceId, version) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify({ deviceId, version });
+    
+    const options = {
+      hostname: 'version-2lbtz4kjxa-uc.a.run.app',
+      port: 443,
+      path: '/',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': data.length
+      }
+    };
+    
+    const req = https.request(options, (res) => {
+      let responseData = '';
+      
+      res.on('data', (chunk) => {
+        responseData += chunk;
+      });
+      
+      res.on('end', () => {
+        console.log(`Version update reported to server. Status: ${res.statusCode}`);
+        resolve(responseData);
+      });
+    });
+    
+    req.on('error', (error) => {
+      console.error('Error reporting version update:', error.message);
+      reject(error);
+    });
+    
+    req.write(data);
+    req.end();
+  });
 }
 
 // Run the script

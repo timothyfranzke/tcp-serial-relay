@@ -1,6 +1,7 @@
 // src/config/index.js
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 const { logger } = require('../utils/logger');
 const { getDeviceId } = require('../utils/device-info');
 const defaultConfig = require('./default-config');
@@ -40,6 +41,113 @@ class ConfigManager {
     this.config = null;
   }
 
+  /**
+   * Fetch configuration from remote endpoint
+   * @param {string} deviceId - Device ID to fetch configuration for
+   * @returns {Promise<object|null>} - Configuration object or null if not found
+   */
+  async fetchRemoteConfig(deviceId) {
+    return new Promise((resolve) => {
+      const url = `https://config-2lbtz4kjxa-uc.a.run.app?docId=${deviceId}`;
+      logger.info(`Attempting to fetch remote configuration from: ${url}`);
+      
+      const req = https.get(url, (res) => {
+        let data = '';
+        
+        res.on('data', (chunk) => {
+          data += chunk;
+        });
+        
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            try {
+              const remoteConfig = JSON.parse(data);
+              logger.info('Remote configuration fetched successfully');
+              resolve(remoteConfig);
+            } catch (error) {
+              logger.warn('Failed to parse remote configuration', { error: error.message });
+              resolve(null);
+            }
+          } else {
+            logger.warn(`Failed to fetch remote configuration, status: ${res.statusCode}`);
+            resolve(null);
+          }
+        });
+      });
+      
+      req.on('error', (error) => {
+        logger.warn('Error fetching remote configuration', { error: error.message });
+        resolve(null);
+      });
+      
+      req.setTimeout(5000, () => {
+        logger.warn('Remote configuration request timed out');
+        req.abort();
+        resolve(null);
+      });
+    });
+  }
+  
+  /**
+   * Post local configuration to remote endpoint
+   * @param {object} config - Configuration object to post
+   * @param {string} deviceId - Device ID to associate with the configuration
+   * @returns {Promise<boolean>} - Success status
+   */
+  async postConfigToRemote(config, deviceId) {
+    return new Promise((resolve) => {
+      const postData = JSON.stringify({
+        ...config,
+        docId: deviceId
+      });
+      
+      const options = {
+        hostname: 'config-2lbtz4kjxa-uc.a.run.app',
+        port: 443,
+        path: '/',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': postData.length
+        }
+      };
+      
+      logger.info('Posting configuration to remote endpoint');
+      
+      const req = https.request(options, (res) => {
+        let responseData = '';
+        
+        res.on('data', (chunk) => {
+          responseData += chunk;
+        });
+        
+        res.on('end', () => {
+          if (res.statusCode === 200 || res.statusCode === 201) {
+            logger.info('Configuration posted successfully to remote endpoint');
+            resolve(true);
+          } else {
+            logger.warn(`Failed to post configuration to remote endpoint, status: ${res.statusCode}`);
+            resolve(false);
+          }
+        });
+      });
+      
+      req.on('error', (error) => {
+        logger.warn('Error posting configuration to remote endpoint', { error: error.message });
+        resolve(false);
+      });
+      
+      req.setTimeout(5000, () => {
+        logger.warn('Remote configuration post request timed out');
+        req.abort();
+        resolve(false);
+      });
+      
+      req.write(postData);
+      req.end();
+    });
+  }
+
   async load() {
     if (this.config) {
       return this.config;
@@ -50,13 +158,37 @@ class ConfigManager {
     logger.info(`Configuration path: ${this.configPath}`);
 
     try {
-      this.ensureConfigDirectory();
-      this.config = await this.loadFromFile();
-      this.applyEnvironmentOverrides();
-      this.validateConfig();
+      // First try to fetch remote configuration
+      const remoteConfig = await this.fetchRemoteConfig(deviceId);
+      
+      if (remoteConfig) {
+        logger.info('Using remote configuration');
+        this.config = { ...defaultConfig, ...remoteConfig };
+        this.applyEnvironmentOverrides();
+        this.validateConfig();
+        
+        // Save the remote config to local file
+        try {
+          this.ensureConfigDirectory();
+          fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), 'utf8');
+          logger.info(`Remote configuration saved to local file: ${this.configPath}`);
+        } catch (error) {
+          logger.warn(`Could not save remote configuration to local file: ${error.message}`);
+        }
+      } else {
+        // Fall back to local configuration
+        logger.info('Remote configuration not available, using local configuration');
+        this.ensureConfigDirectory();
+        this.config = await this.loadFromFile();
+        this.applyEnvironmentOverrides();
+        this.validateConfig();
+        
+        // Post local configuration to remote endpoint
+        await this.postConfigToRemote(this.config, deviceId);
+      }
       
       logger.info('Configuration loaded successfully', {
-        source: fs.existsSync(this.configPath) ? 'file' : 'defaults',
+        source: remoteConfig ? 'remote' : (fs.existsSync(this.configPath) ? 'local file' : 'defaults'),
         configPath: this.configPath,
         config: this.getSafeConfigForLogging()
       });

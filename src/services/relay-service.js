@@ -1,10 +1,12 @@
 // src/services/relay-service.js
 const EventEmitter = require('events');
+const https = require('https');
 const { logger } = require('../utils/logger');
 const { updateStatus, updateConnection, incrementMetric, registerConnection } = require('../utils/status-manager');
 const TcpClient = require('./tcp-client');
 const SerialClient = require('./serial-client');
 const SecondaryTcpClient = require('./secondary-tcp-client');
+const { getDeviceId } = require('../utils/device-info');
 
 /**
  * Main relay service that coordinates TCP and Serial/TCP connections
@@ -19,6 +21,8 @@ class RelayService extends EventEmitter {
     this.dataRelayed = false;
     this.relayTimeout = null;
     this.startTime = null;
+    this.sentMacAddress = false;
+    this.secondaryDataBuffer = []; // Buffer to collect data from secondary client
   }
 
   /**
@@ -76,7 +80,7 @@ class RelayService extends EventEmitter {
         }
       });
 
-      logger.info('Relay service started successfully', {
+      logger.info('Relay service started successfully - here', {
         duration: Date.now() - this.startTime,
         connectionType: this.config.connectionType
       });
@@ -147,7 +151,11 @@ class RelayService extends EventEmitter {
 
     // TCP Client events
     this.tcpClient.on('connected', (info) => {
+      
       logger.info('TCP client connected', info);
+      const deviceId = getDeviceId();
+      logger.info(`Sending MAC address to TCP server: ${deviceId}`);
+      this.tcpClient.send(deviceId);
       updateConnection('tcp', { connected: true, ...info });
     });
 
@@ -158,6 +166,10 @@ class RelayService extends EventEmitter {
     });
 
     this.tcpClient.on('data', (data, metadata) => {
+      console.log('TCP data received', {
+        bytes: data.length,
+        hex: metadata.hex
+      });
       this.handleDataFromTcp(data, metadata);
     });
 
@@ -174,6 +186,24 @@ class RelayService extends EventEmitter {
     });
 
     this.secondaryClient.on('data', (data, metadata) => {
+      console.log('Secondary data received', {
+        bytes: data.length,
+        hex: metadata.hex
+      });
+      // Store data in buffer
+      this.secondaryDataBuffer.push({
+        timestamp: new Date().toISOString(),
+        data: data.toString('hex'),
+        length: data.length,
+        metadata
+      });
+      
+      if (!this.sentMacAddress) {
+        this.sentMacAddress = true;
+        // add mac address to data
+        const deviceId = getDeviceId() + '\n';
+        // data = Buffer.from(deviceId) + data;
+      }
       this.handleDataFromSecondary(data, metadata);
     });
   }
@@ -385,17 +415,155 @@ class RelayService extends EventEmitter {
   }
 
   /**
+   * Get timestamp of last activity
+   * @returns {number|null} Timestamp of last activity
+   */
+  getLastActivity() {
+    const tcpLastActivity = this.tcpClient?.getLastActivity() || 0;
+    const secondaryLastActivity = this.secondaryClient?.getLastActivity() || 0;
+    
+    if (tcpLastActivity === 0 && secondaryLastActivity === 0) {
+      return null;
+    }
+    
+    return Math.max(tcpLastActivity, secondaryLastActivity);
+  }
+
+  /**
+   * Post collected data to the device data endpoint
+   * @returns {Promise<boolean>} Success status
+   */
+  async postDataToEndpoint() {
+    if (this.secondaryDataBuffer.length === 0) {
+      logger.info('No secondary data to post to endpoint');
+      return false;
+    }
+
+    const deviceId = getDeviceId();
+    
+    // Combine all data into a single string (hex format)
+    const combinedData = this.secondaryDataBuffer.map(packet => packet.data).join('');
+    
+    return new Promise((resolve) => {
+      const postData = JSON.stringify({
+        deviceId,
+        data: combinedData
+      });
+      
+      const options = {
+        hostname: 'us-central1-tcp-gateway-26246.cloudfunctions.net',
+        path: '/deviceData',
+        port: 443,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': postData.length
+        }
+      };
+      
+      logger.info('Posting collected data to endpoint', { 
+        endpoint: 'https://us-central1-tcp-gateway-26246.cloudfunctions.net/deviceData',
+        deviceId,
+        dataSize: combinedData.length,
+        packetCount: this.secondaryDataBuffer.length
+      });
+      
+      const req = https.request(options, (res) => {
+        let responseData = '';
+        
+        res.on('data', (chunk) => {
+          responseData += chunk;
+        });
+        
+        res.on('end', () => {
+          if (res.statusCode === 200 || res.statusCode === 201) {
+            logger.info('Data successfully posted to endpoint', { 
+              statusCode: res.statusCode,
+              response: responseData.substring(0, 100) // Log only first 100 chars
+            });
+            resolve(true);
+          } else {
+            logger.warn('Failed to post data to endpoint', { 
+              statusCode: res.statusCode,
+              response: responseData.substring(0, 100)
+            });
+            resolve(false);
+          }
+        });
+      });
+      
+      req.on('error', (error) => {
+        logger.error('Error posting data to endpoint', { error: error.message });
+        resolve(false);
+      });
+      
+      req.setTimeout(10000, () => {
+        logger.warn('Data posting request timed out');
+        req.abort();
+        resolve(false);
+      });
+      
+      req.write(postData);
+      req.end();
+    });
+  }
+
+  /**
+   * Output the collected data from the secondary client buffer
+   */
+  outputSecondaryDataBuffer() {
+    if (this.secondaryDataBuffer.length === 0) {
+      logger.info('No secondary data was collected in the buffer');
+      return;
+    }
+
+    logger.info(`Outputting collected secondary data (${this.secondaryDataBuffer.length} packets):`);
+    
+    // Calculate total bytes
+    const totalBytes = this.secondaryDataBuffer.reduce((sum, item) => sum + item.length, 0);
+    
+    console.log('===== SECONDARY DATA BUFFER SUMMARY =====');
+    console.log(`Total packets: ${this.secondaryDataBuffer.length}`);
+    console.log(`Total bytes: ${totalBytes}`);
+    console.log('\nPacket details:');
+    
+    // Output each packet
+    this.secondaryDataBuffer.forEach((packet, index) => {
+      console.log(`\nPacket #${index + 1}:`);
+      console.log(`  Timestamp: ${packet.timestamp}`);
+      console.log(`  Length: ${packet.length} bytes`);
+      console.log(`  Data (hex): ${packet.data}`);
+      if (packet.metadata && packet.metadata.ascii) {
+        console.log(`  Data (ascii): ${packet.metadata.ascii}`);
+      }
+    });
+    
+    console.log('\n===== END OF SECONDARY DATA BUFFER =====');
+  }
+
+  /**
    * Stop the relay service
    * @returns {Promise} Promise that resolves when stopped
    */
   async stop() {
     if (!this.isRunning) {
-      logger.debug('Relay service is not running');
+      logger.warn('Relay service is not running');
       return;
     }
 
-    logger.info('Stopping relay service...');
-    this.isRunning = false;
+    logger.info('Stopping relay service');
+
+    // Output collected secondary data
+    this.outputSecondaryDataBuffer();
+    
+    // Post data to endpoint if collectData is enabled
+    if (this.config.collectData === true) {
+      logger.info('Data collection is enabled, posting data to endpoint');
+      await this.postDataToEndpoint();
+    }
+    
+    // Clear the buffer after posting
+    this.secondaryDataBuffer = [];
 
     // Clear timeout
     if (this.relayTimeout) {
@@ -403,32 +571,20 @@ class RelayService extends EventEmitter {
       this.relayTimeout = null;
     }
 
-    const stopPromises = [];
+    // Close connections
+    try {
+      if (this.tcpClient) {
+        await this.tcpClient.close();
+      }
 
-    // Close TCP client
-    if (this.tcpClient) {
-      stopPromises.push(
-        this.tcpClient.close().catch(error => {
-          logger.warn('Error closing TCP client', { error: error.message });
-        })
-      );
+      if (this.secondaryClient) {
+        await this.secondaryClient.close();
+      }
+    } catch (error) {
+      logger.error('Error closing connections', { error: error.message });
     }
 
-    // Close Secondary client
-    if (this.secondaryClient) {
-      stopPromises.push(
-        this.secondaryClient.close().catch(error => {
-          const clientType = this.config.connectionType === 'tcp' ? 'Secondary TCP' : 'Serial';
-          logger.warn(`Error closing ${clientType} client`, { error: error.message });
-        })
-      );
-    }
-
-    // Wait for all connections to close
-    await Promise.all(stopPromises);
-
-    const finalStats = this.getStats();
-    
+    this.isRunning = false;
     logger.info('Relay service stopped', {
       dataRelayed: this.dataRelayed,
       duration: finalStats.duration,

@@ -1,6 +1,25 @@
 // src/utils/status-manager.js
-const { logger, safeStringify } = require('./logger');
-const { getDeviceInfo } = require('./device-info');
+const { logger, safeStringify, loggerInstance } = require('./logger');
+const { getDeviceInfo, getDeviceId } = require('./device-info');
+const https = require('https');
+let config = null;
+let updateConfigFunc = null;
+
+// Function to set the config reference
+function setConfig(configObj) {
+  config = configObj;
+  
+  // Enable log collection if specified in config
+  if (config && config.collectLogs === true) {
+    loggerInstance.setCollectLogs(true);
+    logger.info('Log collection enabled from configuration');
+  }
+}
+
+// Function to set the updateConfig function reference
+function setUpdateConfigFunc(func) {
+  updateConfigFunc = func;
+}
 
 /**
  * Manages application status and provides clean exit functionality
@@ -125,9 +144,9 @@ class StatusManager {
    * @param {string} message - Final status message
    * @param {number} exitCode - Process exit code
    */
-  async shutdown(success = false, message = null, exitCode = 0) {
+  async shutdown(success = false, message = '', exitCode = 0) {
     if (this.isShuttingDown) {
-      logger.warn('Shutdown already in progress');
+      logger.warn('Shutdown already in progress, ignoring duplicate request');
       return;
     }
     
@@ -178,7 +197,40 @@ class StatusManager {
 
       const shutdownDuration = Date.now() - startTime;
       logger.info(`Graceful shutdown completed in ${shutdownDuration}ms`, { exitCode });
-
+      
+      // Post status to endpoint
+      try {
+        logger.info('Attempting to post status to endpoint...');
+        await this.postStatusToEndpoint(finalStatus);
+        logger.info('Status successfully posted to endpoint');
+      } catch (error) {
+        logger.error('Error posting status to endpoint', { error: error.message, stack: error.stack });
+      }
+      
+      // Post logs to endpoint if collectLogs is enabled
+      if (config && config.collectLogs === true) {
+        try {
+          logger.info('Posting logs to endpoint as specified in configuration');
+          await loggerInstance.postLogs();
+          
+          // Update config to disable log collection after successful posting
+          if (updateConfigFunc) {
+            try {
+              logger.info('Updating configuration to disable log collection for next run');
+              await updateConfigFunc({ collectLogs: false });
+              // Update local config reference
+              config.collectLogs = false;
+              // Disable log collection in logger
+              loggerInstance.setCollectLogs(false);
+            } catch (configError) {
+              logger.error('Failed to update config to disable log collection', { error: configError.message });
+            }
+          }
+        } catch (error) {
+          logger.error('Error posting logs to endpoint', { error: error.message });
+        }
+      }
+      
       // Give logger time to flush
       await new Promise(resolve => setTimeout(resolve, 100));
 
@@ -190,24 +242,100 @@ class StatusManager {
   }
 
   /**
-   * Setup signal handlers for graceful shutdown
+   * Post status to the status endpoint
+   * @param {Object} status - The current application status
+   * @returns {Promise<void>}
    */
+  async postStatusToEndpoint(status) {
+    return new Promise((resolve, reject) => {
+      try {
+        // Add device ID to the status object
+        const statusWithDeviceId = {
+          ...status,
+          deviceId: getDeviceId()
+        };
+        
+        const data = JSON.stringify(statusWithDeviceId);
+        
+        const options = {
+          hostname: 'status-2lbtz4kjxa-uc.a.run.app',
+          port: 443,
+          path: '/',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': data.length
+          },
+          timeout: 5000 // 5 second timeout
+        };
+        
+        logger.info('Posting status to endpoint', { 
+          endpoint: options.hostname,
+          dataSize: data.length,
+          deviceId: statusWithDeviceId.deviceId 
+        });
+        
+        const req = https.request(options, (res) => {
+          let responseData = '';
+          
+          res.on('data', (chunk) => {
+            responseData += chunk;
+          });
+          
+          res.on('end', () => {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              logger.info(`Status posted to endpoint. Response status: ${res.statusCode}`);
+              resolve();
+            } else {
+              logger.warn(`Status endpoint returned non-success code: ${res.statusCode}`, { response: responseData });
+              resolve(); // Resolve anyway to continue shutdown process
+            }
+          });
+        });
+        
+        req.on('error', (error) => {
+          logger.error('Error posting status to endpoint', { error: error.message, stack: error.stack });
+          resolve(); // Resolve anyway to continue shutdown process
+        });
+        
+        req.on('timeout', () => {
+          logger.error('Status endpoint request timed out');
+          req.destroy();
+          resolve(); // Resolve anyway to continue shutdown process
+        });
+        
+        req.write(data);
+        req.end();
+      } catch (error) {
+        logger.error('Unexpected error in postStatusToEndpoint', { error: error.message, stack: error.stack });
+        resolve(); // Resolve anyway to continue shutdown process
+      }
+    });
+  }
+  
   setupSignalHandlers() {
     const signals = ['SIGINT', 'SIGTERM'];
     
     signals.forEach(signal => {
       process.on(signal, async () => {
         logger.info(`Received ${signal} signal, initiating graceful shutdown`);
-        await this.shutdown(false, `Terminated by ${signal} signal`, 0);
+        try {
+          await this.shutdown(false, `Terminated by ${signal} signal`, 0);
+        } catch (error) {
+          logger.error(`Error during ${signal} shutdown`, { error: error.message, stack: error.stack });
+          process.exit(1);
+        }
       });
     });
 
     process.on('uncaughtException', async (error) => {
-      logger.error('Uncaught exception', { 
-        error: error.message, 
-        stack: error.stack 
-      });
-      await this.shutdown(false, `Uncaught exception: ${error.message}`, 1);
+      logger.error('Uncaught exception', { error: error.message, stack: error.stack });
+      try {
+        await this.shutdown(false, `Terminated by uncaught exception: ${error.message}`, 1);
+      } catch (shutdownError) {
+        logger.error('Error during uncaughtException shutdown', { error: shutdownError.message });
+        process.exit(1);
+      }
     });
 
     process.on('unhandledRejection', async (reason, promise) => {
@@ -232,5 +360,7 @@ module.exports = {
   incrementMetric: (metric, value) => statusManager.incrementMetric(metric, value),
   registerConnection: (name, connection) => statusManager.registerConnection(name, connection),
   shutdown: (success, message, exitCode) => statusManager.shutdown(success, message, exitCode),
-  onShutdown: (handler) => statusManager.onShutdown(handler)
+  onShutdown: (handler) => statusManager.onShutdown(handler),
+  setConfig,
+  setUpdateConfigFunc
 };

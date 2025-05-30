@@ -1,6 +1,6 @@
 {
   "name": "tcp-serial-relay",
-  "version": "1.2.27",
+  "version": "1.2.46",
   "description": "Modular TCP   to Serial relay service with comprehensive logging, monitoring and web dashboard",
   "main": "src/app.js",
   "bin": {

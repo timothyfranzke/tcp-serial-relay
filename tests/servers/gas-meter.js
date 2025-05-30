@@ -89,13 +89,30 @@ class MockTcpServer {
         this.commandTimeouts.delete(socket);
       }
 
-      const receivedCommand = data.toString().trim();
-      logger.info(`Received data from ${clientId}: "${receivedCommand}"`);
+      const receivedData = data.toString().trim();
+      logger.info(`Received data from ${clientId}: "${receivedData}"`);
 
-      if (receivedCommand === '200') {
+      // Check if the received data contains any of the supported commands
+      if (receivedData.includes('200')) {
+        logger.info(`Found command '200' in received data`);
         this.handleCommand200(socket, clientId);
+      } else if (receivedData.includes('I20100')) {
+        logger.info(`Found command 'I20100' in received data`);
+        this.handleCommandI20100(socket, clientId);
+      } else if (receivedData.includes('I20200')) {
+        logger.info(`Found command 'I20200' in received data`);
+        this.handleCommandI20200(socket, clientId);
+      } else if (receivedData.includes('I37300')) {
+        logger.info(`Found command 'I37300' in received data`);
+        this.handleCommandI37300(socket, clientId);
+      } else if (receivedData.includes('I30100')) {
+        logger.info(`Found command 'I30100' in received data`);
+        this.handleCommandI30100(socket, clientId);
+      } else if (receivedData.includes('I20700')) {
+        logger.info(`Found command 'I20700' in received data`);
+        this.handleCommandI20700(socket, clientId);
       } else {
-        logger.warn(`Received unknown command from ${clientId}: "${receivedCommand}". Not responding.`);
+        logger.warn(`Received unknown command from ${clientId}: "${receivedData}". Not responding.`);
         // Set a new timeout for the next command
         const newTimeout = setTimeout(() => {
           logger.warn(`No valid command received from ${clientId}. Closing connection.`);
@@ -134,18 +151,97 @@ class MockTcpServer {
 
     const dateLine = `${month} ${day}, ${year}  ${hours}:${minutes} ${ampm}`;
 
-    const responseData = `FUEL EXPRESSO ZIPZ
-12671 ANTIOCH RD
-O.P. KS. 66213
+    const responseData = `
+    200 
+    FUEL EXPRESSO ZIPZ
+    12671 ANTIOCH RD
+    O.P. KS. 66213
 
-${dateLine}
+    ${dateLine}
 
-TANK  PRODUCT               GALLONS  INCHES   WATER  DEG F   ULLAGE
+    TANK  PRODUCT               GALLONS  INCHES   WATER  DEG F   ULLAGE
 
-  1   UNLEADED                 7598   56.71     0.0   64.3     3997
-  2   PREMIUM                  1976   23.73     0.0   62.3     7720
+    1   UNLEADED                 7598   56.71     0.0   64.3     3997
+    2   PREMIUM                  1976   23.73     0.0   62.3     7720
 `;
 
+    this.sendResponse(socket, clientId, responseData, true);
+  }
+
+  /**
+   * Handle I20100 command - Get tank inventory data
+   */
+  handleCommandI20100(socket, clientId) {
+    logger.info(`Recognized "I20100" command from ${clientId}. Preparing tank inventory response...`);
+
+    const responseData = `I20100
+1,REGULAR,7598.2,3997.8,56.71,0.00,64.3,11596.0,0,0,0,0,0
+2,PREMIUM,1976.5,7720.5,23.73,0.00,62.3,9697.0,0,0,0,0,0
+`;
+
+    this.sendResponse(socket, clientId, responseData);
+  }
+
+  /**
+   * Handle I20200 command - Get delivery data
+   */
+  handleCommandI20200(socket, clientId) {
+    logger.info(`Recognized "I20200" command from ${clientId}. Preparing delivery data response...`);
+
+    const responseData = `I20200
+1,05/28/2025,08:15,REGULAR,1500.0,5500.0,7000.0
+2,05/27/2025,14:30,PREMIUM,800.0,1200.0,2000.0
+`;
+
+    this.sendResponse(socket, clientId, responseData);
+  }
+
+  /**
+   * Handle I37300 command - Get alarm status
+   */
+  handleCommandI37300(socket, clientId) {
+    logger.info(`Recognized "I37300" command from ${clientId}. Preparing alarm status response...`);
+
+    const responseData = `I37300
+NO ACTIVE ALARMS
+`;
+
+    this.sendResponse(socket, clientId, responseData);
+  }
+
+  /**
+   * Handle I30100 command - Get system status
+   */
+  handleCommandI30100(socket, clientId) {
+    logger.info(`Recognized "I30100" command from ${clientId}. Preparing system status response...`);
+
+    const responseData = `I30100
+SYSTEM NORMAL
+FIRMWARE: v2.5.1
+UPTIME: 15 DAYS
+`;
+
+    this.sendResponse(socket, clientId, responseData);
+  }
+
+  /**
+   * Handle I20700 command - Get tank leak test results
+   */
+  handleCommandI20700(socket, clientId) {
+    logger.info(`Recognized "I20700" command from ${clientId}. Preparing leak test results...`);
+
+    const responseData = `I20700
+1,05/28/2025,PASS,0.05,24.0
+2,05/28/2025,PASS,0.02,24.0
+`;
+
+    this.sendResponse(socket, clientId, responseData);
+  }
+
+  /**
+   * Send response to client with proper delay and connection handling
+   */
+  sendResponse(socket, clientId, responseData) {
     // Simulate sending data from the mock device to the client after a small delay
     setTimeout(() => {
       if (socket.destroyed) {
@@ -164,11 +260,12 @@ TANK  PRODUCT               GALLONS  INCHES   WATER  DEG F   ULLAGE
 
         logger.info(`Response sent successfully to ${clientId}`);
         
-        // After sending the response, close the connection to simulate a transactional device
-        setTimeout(() => {
-          logger.info(`Closing connection to ${clientId} after response`);
+        // Set a new timeout for the next command
+        const newTimeout = setTimeout(() => {
+          logger.warn(`No follow-up command received from ${clientId}. Closing connection.`);
           this.cleanupConnection(socket);
-        }, CLOSE_DELAY);
+        }, NO_COMMAND_TIMEOUT);
+        this.commandTimeouts.set(socket, newTimeout);
       });
     }, RESPONSE_DELAY);
   }
@@ -242,27 +339,43 @@ const mockServer = new MockTcpServer();
 // Start the server
 mockServer.start();
 
-// Handle graceful shutdown
+// Handle process termination
 process.on('SIGINT', () => {
-  logger.info('Received SIGINT. Shutting down mock TCP server...');
-  mockServer.stop();
+logger.info('Received SIGINT signal. Shutting down mock TCP server...');
+mockServer.stop();
 });
 
 process.on('SIGTERM', () => {
-  logger.info('Received SIGTERM. Shutting down mock TCP server...');
-  mockServer.stop();
+logger.info('Received SIGTERM signal. Shutting down mock TCP server...');
+mockServer.stop();
 });
 
-// Handle uncaught exceptions
+logger.info('Mock TCP Server process started');
+
+// Log available commands
+logger.info('Available commands:');
+logger.info('- 200: Get tank inventory in human-readable format');
+logger.info('- I20100: Get tank inventory data in machine format');
+logger.info('- I20200: Get delivery data');
+logger.info('- I37300: Get alarm status');
+logger.info('- I30100: Get system status');
+logger.info('- I20700: Get tank leak test results');
+
+// If this script is run directly (not imported as a module)
+if (require.main === module) {
+logger.info(`Starting mock TCP server on ${MOCK_TCP_HOST}:${MOCK_TCP_PORT}`);
+// Server is already started above
+}
+
 process.on('uncaughtException', (err) => {
-  logger.error(`Uncaught exception: ${err.message}`);
-  logger.error(err.stack);
-  mockServer.stop();
+logger.error(`Uncaught exception: ${err.message}`);
+logger.error(err.stack);
+mockServer.stop();
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  logger.error(`Unhandled rejection at: ${promise}, reason: ${reason}`);
-  mockServer.stop();
+logger.error(`Unhandled rejection at: ${promise}, reason: ${reason}`);
+mockServer.stop();
 });
 
 // Export for potential use as a module

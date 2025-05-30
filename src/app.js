@@ -2,8 +2,8 @@
 require('dotenv').config();
 
 const { logger } = require('./utils/logger');
-const { loadConfig } = require('./config');
-const { shutdown, updateStatus, onShutdown } = require('./utils/status-manager');
+const { loadConfig, updateConfig } = require('./config');
+const { shutdown, updateStatus, onShutdown, getStatus, setConfig, setUpdateConfigFunc } = require('./utils/status-manager');
 const { getDeviceInfo } = require('./utils/device-info');
 const RelayService = require('./services/relay-service');
 
@@ -65,6 +65,12 @@ class TcpSerialRelayApp {
     try {
       this.config = await loadConfig();
       
+      // Pass the config to the status manager for log collection
+      setConfig(this.config);
+      
+      // Pass the updateConfig function to the status manager
+      setUpdateConfigFunc(updateConfig);
+      
       const logData = {
         connectionType: this.config.connectionType
       };
@@ -116,7 +122,7 @@ class TcpSerialRelayApp {
 
     // Data successfully relayed
     this.relayService.on('dataRelayed', (info) => {
-      logger.info('Data relayed successfully', info);
+      logger.info('Data relayed successfully to TCP', info);
       // Update metrics are handled in RelayService
     });
 
@@ -201,6 +207,8 @@ class TcpSerialRelayApp {
     };
   }
 }
+
+
 
 /**
  * Main entry point

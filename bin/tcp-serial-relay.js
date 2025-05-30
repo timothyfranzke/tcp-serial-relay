@@ -329,6 +329,52 @@ program
     }
   });
 
+// Command service management
+program
+  .command('command-service')
+  .description('Start the remote command service')
+  .option('-i, --interval <seconds>', 'Polling interval in seconds', '60')
+  .option('-d, --daemon', 'Run as daemon in background')
+  .option('--endpoint <url>', 'Command API endpoint', 'https://command-2lbtz4kjxa-uc.a.run.app')
+  .option('--device-id <id>', 'Custom device ID (defaults to hostname)')
+  .action(async (options) => {
+    const commandServiceScript = path.join(__dirname, '..', 'scripts', 'command-service.js');
+    
+    // Set environment variables for the command service
+    const env = { ...process.env };
+    
+    if (options.endpoint) {
+      env.COMMAND_ENDPOINT = options.endpoint;
+    }
+    
+    if (options.deviceId) {
+      env.DEVICE_ID = options.deviceId;
+    }
+    
+    if (options.interval) {
+      env.POLL_INTERVAL = (parseInt(options.interval) * 1000).toString();
+    }
+    
+    console.log('Starting command service...');
+    
+    if (options.daemon) {
+      // Run as daemon (detached process)
+      const child = spawn('node', [commandServiceScript], {
+        detached: true,
+        stdio: 'ignore',
+        env
+      });
+      child.unref();
+      console.log(`Command service started as daemon with PID: ${child.pid}`);
+    } else {
+      // Run in foreground
+      spawn('node', [commandServiceScript], {
+        stdio: 'inherit',
+        env
+      });
+    }
+  });
+
 // Test connection command
 program
   .command('test')

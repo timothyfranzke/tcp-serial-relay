@@ -55,9 +55,9 @@ class MainTcpServer {
       logger.info('Waiting for relay connections...');
       
       if (AUTO_COMMAND_INTERVAL > 0) {
-        logger.info(`Auto-command enabled: will send "200" every ${AUTO_COMMAND_INTERVAL}ms when clients connect`);
+        logger.info(`Auto-command enabled: will send ASCII Ctrl+A + "200" every ${AUTO_COMMAND_INTERVAL}ms when clients connect`);
       } else {
-        logger.info('Auto-command disabled: will send "200" once on connection and when data is received');
+        logger.info('Auto-command disabled: will send ASCII Ctrl+A + "200" once on connection and when data is received');
       }
     });
   }
@@ -77,15 +77,17 @@ class MainTcpServer {
       connected: true,
       dataReceived: 0,
       commandsSent: 0,
-      lastActivity: new Date()
+      lastActivity: new Date(),
+      aggregatedData: Buffer.alloc(0),
+      aggregationTimeout: null
     };
     
     this.activeConnections.set(socket, connectionInfo);
 
-    // Send initial "200" command after a brief delay
+    // Send initial ASCII Ctrl+A + "200" command after a brief delay
     setTimeout(() => {
       if (!socket.destroyed && socket.writable) {
-        this.sendCommand(socket, '200', 'initial connection');
+        this.sendAsciiCommand(socket, 'initial connection');
       }
     }, COMMAND_DELAY);
 
@@ -93,7 +95,7 @@ class MainTcpServer {
     if (AUTO_COMMAND_INTERVAL > 0) {
       const intervalId = setInterval(() => {
         if (!socket.destroyed && socket.writable) {
-          this.sendCommand(socket, '200', 'auto-interval');
+          this.sendAsciiCommand(socket, 'auto-interval');
         } else {
           clearInterval(intervalId);
           this.autoCommandIntervals.delete(socket);
@@ -134,28 +136,100 @@ class MainTcpServer {
     connectionInfo.dataReceived++;
     connectionInfo.lastActivity = new Date();
 
-    const dataStr = data.toString();
-    logger.info(`Received data from ${connectionInfo.clientId} (${data.length} bytes):`);
-    
-    // Log the response in a readable format
-    if (dataStr.includes('FUEL EXPRESSO') || dataStr.includes('UNLEADED') || dataStr.includes('PREMIUM')) {
-      logger.info('Received fuel data response:');
-      console.log('=====================================');
-      console.log(dataStr);
-      console.log('=====================================');
-    } else {
-      logger.info(`Data content: "${dataStr.trim()}"`);
+    // Append new data to the aggregated buffer
+    connectionInfo.aggregatedData = Buffer.concat([connectionInfo.aggregatedData, data]);
+
+    // Just log that we received data, but don't show the content yet
+    logger.info(`Received ${data.length} bytes from ${connectionInfo.clientId} (total aggregated: ${connectionInfo.aggregatedData.length} bytes)`);
+
+    // Reset the aggregation timeout
+    if (connectionInfo.aggregationTimeout) {
+      clearTimeout(connectionInfo.aggregationTimeout);
     }
 
-    // Send another "200" command after receiving data (simulating ongoing requests)
+    // Set a timeout to output final result if no more data comes in
+    connectionInfo.aggregationTimeout = setTimeout(() => {
+      this.outputFinalResult(connectionInfo, 'timeout');
+    }, 3000); // 3 second timeout
+
+    // Send another ASCII Ctrl+A + "200" command after receiving data (simulating ongoing requests)
     setTimeout(() => {
       if (!socket.destroyed && socket.writable && AUTO_COMMAND_INTERVAL === 0) {
-        this.sendCommand(socket, '200', 'response to data');
+        this.sendAsciiCommand(socket, 'response to data');
       }
     }, COMMAND_DELAY);
   }
 
+  outputFinalResult(connectionInfo, reason) {
+    if (!connectionInfo.aggregatedData || connectionInfo.aggregatedData.length === 0) {
+      logger.info(`No data to output for ${connectionInfo.clientId}`);
+      return;
+    }
+
+    const dataStr = connectionInfo.aggregatedData.toString();
+    const dataHex = connectionInfo.aggregatedData.toString('hex');
+    
+    logger.info(`=== FINAL AGGREGATED RESULT (${reason}) ===`);
+    logger.info(`Connection: ${connectionInfo.clientId}`);
+    logger.info(`Total bytes received: ${connectionInfo.aggregatedData.length}`);
+    logger.info(`Commands sent: ${connectionInfo.commandsSent}`);
+    logger.info(`HEX: ${dataHex}`);
+    
+    // Log the response in a readable format
+    if (dataStr.includes('FUEL EXPRESSO') || dataStr.includes('UNLEADED') || dataStr.includes('PREMIUM')) {
+      logger.info('Final fuel data response:');
+      console.log('=====================================');
+      console.log(dataStr);
+      console.log('=====================================');
+    } else {
+      logger.info('Final data content:');
+      console.log('=====================================');
+      console.log(`"${dataStr.trim()}"`);
+      console.log('=====================================');
+    }
+    
+    // Clear the aggregated data to prevent duplicate output
+    connectionInfo.aggregatedData = Buffer.alloc(0);
+    
+    // Clear the timeout
+    if (connectionInfo.aggregationTimeout) {
+      clearTimeout(connectionInfo.aggregationTimeout);
+      connectionInfo.aggregationTimeout = null;
+    }
+  }
+
+  sendAsciiCommand(socket, reason) {
+    const connectionInfo = this.activeConnections.get(socket);
+    if (!connectionInfo) return;
+
+    try {
+      // Create ASCII command: Ctrl+A (0x01) + "200"
+      const ctrlA = String.fromCharCode(0x01);  // ASCII Control-A character
+      const command = ctrlA + '200';
+      const commandBuffer = Buffer.from(command, 'ascii');
+      
+      socket.write(commandBuffer);
+      connectionInfo.commandsSent++;
+      connectionInfo.lastActivity = new Date();
+      
+      // Log with hex representation for clarity
+      const commandHex = commandBuffer.toString('hex');
+      logger.info(`Sent ASCII Ctrl+A + "200" to ${connectionInfo.clientId} (reason: ${reason}, total sent: ${connectionInfo.commandsSent})`);
+      logger.info(`Command as HEX: ${commandHex}`);
+    } catch (error) {
+      logger.error(`Failed to send command to ${connectionInfo.clientId}: ${error.message}`);
+    }
+  }
+
+  // Legacy method for backward compatibility - now sends ASCII too
   sendCommand(socket, command, reason) {
+    // If the old string format is used, convert it to ASCII
+    if (command === 'cntl+a 200') {
+      this.sendAsciiCommand(socket, reason);
+      return;
+    }
+    
+    // For any other commands, send as-is
     const connectionInfo = this.activeConnections.get(socket);
     if (!connectionInfo) return;
 
@@ -173,7 +247,15 @@ class MainTcpServer {
   cleanupConnection(socket) {
     const connectionInfo = this.activeConnections.get(socket);
     if (connectionInfo) {
-      logger.info(`Cleaning up connection ${connectionInfo.clientId} - Commands sent: ${connectionInfo.commandsSent}, Data received: ${connectionInfo.dataReceived}`);
+      // Output final result before cleanup
+      this.outputFinalResult(connectionInfo, 'connection closed');
+      
+      logger.info(`Cleaning up connection ${connectionInfo.clientId} - Commands sent: ${connectionInfo.commandsSent}, Data packets received: ${connectionInfo.dataReceived}`);
+      
+      // Clear aggregation timeout if it exists
+      if (connectionInfo.aggregationTimeout) {
+        clearTimeout(connectionInfo.aggregationTimeout);
+      }
     }
 
     // Clear auto-command interval

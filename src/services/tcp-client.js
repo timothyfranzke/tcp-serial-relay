@@ -271,7 +271,9 @@ class TcpClient extends EventEmitter {
       lastError: this.lastError
     });
   }
-
+  async write(data) {
+    this.socket.write(data);
+  }
   /**
    * Send data through TCP connection with error handling
    * @param {Buffer} data - Data to send
@@ -297,6 +299,11 @@ class TcpClient extends EventEmitter {
             });
             reject(error);
           } else {
+            logger.info('TCP data sent', {
+              bytes: data.length,
+              hex: data.toString('hex'),
+              totalSent: this.totalBytesSent
+            });
             this.totalBytesSent += data.length;
             
             const dataHex = data.toString('hex');
