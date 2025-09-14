@@ -2,7 +2,7 @@
 
 A modular TCP to Serial relay service with comprehensive logging, monitoring, and a web dashboard.
 
-## Features
+## Available Features 
 
 - **Bidirectional Relay**: Relay data between TCP and Serial connections
 - **Robust Error Handling**: Automatic reconnection and comprehensive error recovery
