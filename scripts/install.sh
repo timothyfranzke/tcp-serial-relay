@@ -1,18 +1,17 @@
 #!/bin/bash
 
-# TCP-Serial Relay Installation Script for Raspberry Pi
-# This script installs and configures the relay service for cron execution
+# TCP-Serial Relay IoT Application Installation Script
+# For distributed Linux devices connecting to gas meters
 
-set -e
+set -e  # Exit on any error
 
 # Configuration
 APP_NAME="tcp-serial-relay"
 APP_USER="relay"
-APP_DIR="/opt/$APP_NAME"
-LOG_DIR="/var/log/$APP_NAME"
-CONFIG_DIR="/etc/$APP_NAME"
-SERVICE_DIR="/etc/systemd/system"
-REPO_URL="https://github.com/yourusername/tcp-serial-relay.git"
+APP_DIR="/opt/${APP_NAME}"
+CONFIG_DIR="/etc/${APP_NAME}"
+LOG_DIR="/var/log/${APP_NAME}"
+SERVICE_NAME="${APP_NAME}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -21,465 +20,466 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Logging function
-log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}"
+# Logging functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
 }
 
-warn() {
-    echo -e "${YELLOW}[$(date +'%Y-%m-%d %H:%M:%S')] WARNING: $1${NC}"
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
 }
 
-error() {
-    echo -e "${RED}[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $1${NC}"
-    exit 1
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
 }
 
 # Check if running as root
 check_root() {
-    if [[ $EUID -eq 0 ]]; then
-        error "This script should not be run as root. Please run as a regular user with sudo privileges."
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root (use sudo)"
+        exit 1
     fi
 }
 
-# Check if running on Raspberry Pi
-check_raspberry_pi() {
-    if ! grep -q "Raspberry Pi" /proc/device-tree/model 2>/dev/null; then
-        warn "This doesn't appear to be a Raspberry Pi, but continuing anyway..."
+# Detect Linux distribution
+detect_distro() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        DISTRO=$ID
+        VERSION=$VERSION_ID
     else
-        log "Detected Raspberry Pi: $(cat /proc/device-tree/model)"
+        log_error "Cannot detect Linux distribution"
+        exit 1
     fi
+    log_info "Detected distribution: $DISTRO $VERSION"
 }
 
 # Install system dependencies
-install_dependencies() {
-    log "Installing system dependencies..."
+install_system_deps() {
+    log_info "Installing system dependencies..."
     
-    sudo apt-get update -qq
-    sudo apt-get install -y \
-        curl \
-        git \
-        build-essential \
-        python3-dev \
-        libudev-dev \
-        pkg-config \
-        logrotate \
-        cron
+    case $DISTRO in
+        "ubuntu"|"debian")
+            apt-get update
+            apt-get install -y curl wget gnupg2 software-properties-common build-essential
+            # For serial port access
+            apt-get install -y udev
+            ;;
+        "centos"|"rhel"|"fedora")
+            if command -v dnf &> /dev/null; then
+                dnf update -y
+                dnf install -y curl wget gnupg2 gcc gcc-c++ make
+            else
+                yum update -y
+                yum install -y curl wget gnupg2 gcc gcc-c++ make
+            fi
+            ;;
+        "alpine")
+            apk update
+            apk add --no-cache curl wget gnupg build-base linux-headers udev
+            ;;
+        *)
+            log_warning "Unsupported distribution: $DISTRO. Continuing anyway..."
+            ;;
+    esac
     
-    # Install Node.js LTS if not present
-    if ! command -v node &> /dev/null; then
-        log "Installing Node.js LTS..."
-        curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-        sudo apt-get install -y nodejs
-    else
-        log "Node.js already installed: $(node --version)"
+    log_success "System dependencies installed"
+}
+
+# Install Node.js
+install_nodejs() {
+    log_info "Installing Node.js..."
+    
+    # Check if Node.js is already installed
+    if command -v node &> /dev/null; then
+        NODE_VERSION=$(node --version)
+        log_info "Node.js is already installed: $NODE_VERSION"
+        
+        # Check if version is recent enough (v16+)
+        if [[ "$NODE_VERSION" < "v16" ]]; then
+            log_warning "Node.js version is too old. Installing newer version..."
+        else
+            log_success "Node.js version is acceptable"
+            return 0
+        fi
     fi
     
-    # Install PM2 for process management (optional)
-    if ! command -v pm2 &> /dev/null; then
-        log "Installing PM2..."
-        sudo npm install -g pm2
+    # Install Node.js via NodeSource repository
+    case $DISTRO in
+        "ubuntu"|"debian")
+            curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+            apt-get install -y nodejs
+            ;;
+        "centos"|"rhel"|"fedora")
+            curl -fsSL https://rpm.nodesource.com/setup_lts.x | bash -
+            if command -v dnf &> /dev/null; then
+                dnf install -y nodejs npm
+            else
+                yum install -y nodejs npm
+            fi
+            ;;
+        "alpine")
+            apk add --no-cache nodejs npm
+            ;;
+        *)
+            log_error "Cannot install Node.js for distribution: $DISTRO"
+            exit 1
+            ;;
+    esac
+    
+    log_success "Node.js installed: $(node --version)"
+}
+
+# Install PM2 globally
+install_pm2() {
+    log_info "Installing PM2 process manager..."
+    
+    if command -v pm2 &> /dev/null; then
+        log_info "PM2 is already installed: $(pm2 --version)"
+        return 0
     fi
+    
+    npm install -g pm2
+    
+    # Setup PM2 startup script
+    pm2 startup
+    
+    log_success "PM2 installed and configured for startup"
 }
 
 # Create application user
-create_user() {
-    if ! id "$APP_USER" &>/dev/null; then
-        log "Creating application user: $APP_USER"
-        sudo useradd -r -s /bin/false -d $APP_DIR $APP_USER
-        # Add user to dialout group for serial port access
-        sudo usermod -a -G dialout $APP_USER
-    else
-        log "User $APP_USER already exists"
+create_app_user() {
+    log_info "Creating application user: $APP_USER"
+    
+    if id "$APP_USER" &>/dev/null; then
+        log_info "User $APP_USER already exists"
+        return 0
     fi
+    
+    # Create user with no login shell and home directory
+    useradd --system --home-dir "$APP_DIR" --shell /bin/false --comment "TCP-Serial Relay Service" "$APP_USER"
+    
+    # Add user to dialout group for serial port access
+    usermod -a -G dialout "$APP_USER" 2>/dev/null || log_warning "Could not add user to dialout group"
+    
+    log_success "Application user created: $APP_USER"
 }
 
-# Create directories
+# Create directory structure
 create_directories() {
-    log "Creating application directories..."
+    log_info "Creating directory structure..."
     
-    sudo mkdir -p $APP_DIR
-    sudo mkdir -p $LOG_DIR
-    sudo mkdir -p $CONFIG_DIR
-    sudo mkdir -p $APP_DIR/logs
-    sudo mkdir -p $APP_DIR/status
+    # Create main directories
+    mkdir -p "$APP_DIR"
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$LOG_DIR"
     
     # Set ownership
-    sudo chown -R $APP_USER:$APP_USER $APP_DIR
-    sudo chown -R $APP_USER:$APP_USER $LOG_DIR
-    sudo chown -R root:$APP_USER $CONFIG_DIR
-    sudo chmod 755 $CONFIG_DIR
+    chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+    chown -R "$APP_USER:$APP_USER" "$CONFIG_DIR"
+    chown -R "$APP_USER:$APP_USER" "$LOG_DIR"
+    
+    # Set permissions
+    chmod 755 "$APP_DIR"
+    chmod 755 "$CONFIG_DIR"
+    chmod 755 "$LOG_DIR"
+    
+    log_success "Directory structure created"
 }
 
-# Install application
-install_application() {
-    log "Installing application to $APP_DIR..."
+# Copy application files
+copy_app_files() {
+    log_info "Copying application files..."
     
-    # If local installation (script run from repo directory)
-    if [[ -f "package.json" && -d "src" ]]; then
-        log "Installing from local directory..."
-        sudo cp -r . $APP_DIR/
-        sudo rm -rf $APP_DIR/.git $APP_DIR/node_modules
-    else
-        # Clone from repository
-        log "Cloning from repository: $REPO_URL"
-        sudo git clone $REPO_URL $APP_DIR
-    fi
+    # Determine source directory (where this script is located)
+    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
     
-    # Install npm dependencies
-    cd $APP_DIR
-    sudo -u $APP_USER npm install --production
+    # Copy main application files
+    cp -r "$SCRIPT_DIR"/* "$APP_DIR/" 2>/dev/null || {
+        log_error "Failed to copy application files. Make sure this script is in the application root directory."
+        exit 1
+    }
     
-    # Make scripts executable
-    sudo chmod +x $APP_DIR/scripts/*.sh
+    # Remove the install script from the app directory
+    rm -f "$APP_DIR/install.sh"
     
-    # Set proper ownership
-    sudo chown -R $APP_USER:$APP_USER $APP_DIR
+    # Set ownership
+    chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+    
+    # Make main script executable
+    chmod +x "$APP_DIR/src/app.js" 2>/dev/null || chmod +x "$APP_DIR/app.js" 2>/dev/null || true
+    
+    log_success "Application files copied"
 }
 
-# Configure application
-configure_application() {
-    log "Setting up configuration..."
+# Install Node.js dependencies
+install_node_deps() {
+    log_info "Installing Node.js dependencies..."
     
-    # Create default configuration if it doesn't exist
-    if [[ ! -f "$CONFIG_DIR/relay-config.json" ]]; then
-        cat > /tmp/relay-config.json << EOF
+    cd "$APP_DIR"
+    
+    # Install production dependencies
+    sudo -u "$APP_USER" npm install --production
+    
+    log_success "Node.js dependencies installed"
+}
+
+# Create default configuration
+create_config() {
+    log_info "Creating default configuration..."
+    
+    # Create default config file if it doesn't exist
+    if [ ! -f "$CONFIG_DIR/relay-config.json" ]; then
+        cat > "$CONFIG_DIR/relay-config.json" << EOF
 {
   "tcpIp": "192.168.1.90",
   "tcpPort": 10002,
+  "connectionType": "serial",
   "serialPath": "/dev/ttyUSB0",
   "serialBaud": 9600,
   "serialParity": "odd",
   "serialDataBits": 7,
   "serialStopBits": 1,
+  "secondaryTcpIp": "192.168.1.91",
+  "secondaryTcpPort": 10003,
   "maxRetries": 3,
   "retryDelay": 5000,
   "connectionTimeout": 10000,
   "relayTimeout": 30000,
+  "bufferSize": 1024,
   "logDataTransfers": true,
-  "logLevel": "info"
+  "logLevel": "info",
+  "collectLogs": false,
+  "collectData": false
 }
 EOF
-        sudo mv /tmp/relay-config.json $CONFIG_DIR/
-        sudo chown root:$APP_USER $CONFIG_DIR/relay-config.json
-        sudo chmod 640 $CONFIG_DIR/relay-config.json
+        
+        chown "$APP_USER:$APP_USER" "$CONFIG_DIR/relay-config.json"
+        chmod 644 "$CONFIG_DIR/relay-config.json"
+        
+        log_success "Default configuration created at $CONFIG_DIR/relay-config.json"
+    else
+        log_info "Configuration file already exists"
     fi
-    
-    # Create environment file
-    cat > /tmp/relay.env << EOF
-NODE_ENV=production
-LOG_LEVEL=info
-CONFIG_PATH=$CONFIG_DIR/relay-config.json
-LOG_DIR=$LOG_DIR
-APP_DIR=$APP_DIR
-EOF
-    sudo mv /tmp/relay.env $CONFIG_DIR/
-    sudo chown root:$APP_USER $CONFIG_DIR/relay.env
-    sudo chmod 640 $CONFIG_DIR/relay.env
 }
 
-# Setup systemd service (optional, for manual runs)
-setup_systemd_service() {
-    log "Creating systemd service..."
+# Create PM2 ecosystem file
+create_pm2_config() {
+    log_info "Creating PM2 ecosystem configuration..."
     
-    cat > /tmp/$APP_NAME.service << EOF
+    cat > "$APP_DIR/ecosystem.config.js" << EOF
+module.exports = {
+  apps: [
+    {
+      name: '${SERVICE_NAME}',
+      script: './src/app.js',
+      cwd: '${APP_DIR}',
+      user: '${APP_USER}',
+      instances: 1,
+      exec_mode: 'fork',
+      restart_delay: 5000,
+      max_restarts: 10,
+      min_uptime: '10s',
+      kill_timeout: 5000,
+      env: {
+        NODE_ENV: 'production',
+        CONFIG_PATH: '${CONFIG_DIR}/relay-config.json'
+      },
+      log_file: '${LOG_DIR}/combined.log',
+      out_file: '${LOG_DIR}/out.log',
+      error_file: '${LOG_DIR}/error.log',
+      time: true,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+      merge_logs: true,
+      max_log_size: '10M',
+      retain_logs: 10
+    }
+  ]
+};
+EOF
+    
+    chown "$APP_USER:$APP_USER" "$APP_DIR/ecosystem.config.js"
+    
+    log_success "PM2 ecosystem configuration created"
+}
+
+# Setup udev rules for serial ports
+setup_udev_rules() {
+    log_info "Setting up udev rules for serial port access..."
+    
+    cat > /etc/udev/rules.d/99-tcp-serial-relay.rules << EOF
+# TCP-Serial Relay udev rules
+# Allow access to serial ports for the relay user
+SUBSYSTEM=="tty", GROUP="dialout", MODE="0664"
+KERNEL=="ttyUSB*", GROUP="dialout", MODE="0664"
+KERNEL=="ttyACM*", GROUP="dialout", MODE="0664"
+KERNEL=="ttyS*", GROUP="dialout", MODE="0664"
+EOF
+    
+    # Reload udev rules
+    udevadm control --reload-rules
+    udevadm trigger
+    
+    log_success "Udev rules configured"
+}
+
+# Setup log rotation
+setup_log_rotation() {
+    log_info "Setting up log rotation..."
+    
+    cat > /etc/logrotate.d/${SERVICE_NAME} << EOF
+${LOG_DIR}/*.log {
+    daily
+    missingok
+    rotate 30
+    compress
+    delaycompress
+    notifempty
+    sharedscripts
+    postrotate
+        /usr/bin/pm2 reloadLogs
+    endscript
+}
+EOF
+    
+    log_success "Log rotation configured"
+}
+
+# Create systemd service for PM2 (alternative to PM2 startup)
+create_systemd_service() {
+    log_info "Creating systemd service..."
+    
+    cat > /etc/systemd/system/${SERVICE_NAME}.service << EOF
 [Unit]
-Description=TCP-Serial Relay Service
+Description=TCP-Serial Relay IoT Service
+Documentation=https://pm2.keymetrics.io/
 After=network.target
-Wants=network.target
 
 [Service]
-Type=simple
-User=$APP_USER
-Group=$APP_USER
-WorkingDirectory=$APP_DIR
-EnvironmentFile=$CONFIG_DIR/relay.env
-ExecStart=/usr/bin/node $APP_DIR/src/app.js
-Restart=no
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=$APP_NAME
-
-# Security settings
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=$LOG_DIR $APP_DIR/logs $APP_DIR/status $CONFIG_DIR
+Type=notify
+User=${APP_USER}
+Group=${APP_USER}
+WorkingDirectory=${APP_DIR}
+Environment=HOME=${APP_DIR}
+Environment=PM2_HOME=${APP_DIR}/.pm2
+ExecStart=/usr/bin/pm2 start ${APP_DIR}/ecosystem.config.js --no-daemon
+ExecReload=/usr/bin/pm2 reload ${APP_DIR}/ecosystem.config.js
+ExecStop=/usr/bin/pm2 stop ${APP_DIR}/ecosystem.config.js
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
     
-    sudo mv /tmp/$APP_NAME.service $SERVICE_DIR/
-    sudo systemctl daemon-reload
+    systemctl daemon-reload
+    systemctl enable ${SERVICE_NAME}
     
-    log "Systemd service created (not enabled by default for cron usage)"
+    log_success "Systemd service created and enabled"
 }
 
-# Setup cron job
-setup_cron() {
-    log "Setting up hourly cron job..."
+# Setup firewall rules (if needed)
+setup_firewall() {
+    log_info "Checking firewall configuration..."
     
-    # Create cron script
-    cat > /tmp/tcp-serial-relay-cron.sh << 'EOF'
-#!/bin/bash
-
-# TCP-Serial Relay Cron Script
-# Runs the relay service and logs results
-
-APP_DIR="/opt/tcp-serial-relay"
-LOG_DIR="/var/log/tcp-serial-relay"
-CONFIG_DIR="/etc/tcp-serial-relay"
-STATUS_DIR="$APP_DIR/status"
-LOCK_FILE="/tmp/tcp-serial-relay.lock"
-
-# Source environment
-if [[ -f "$CONFIG_DIR/relay.env" ]]; then
-    source "$CONFIG_DIR/relay.env"
-fi
-
-# Function to log with timestamp
-log_message() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_DIR/cron.log"
-}
-
-# Check if already running
-if [[ -f "$LOCK_FILE" ]]; then
-    pid=$(cat "$LOCK_FILE")
-    if kill -0 "$pid" 2>/dev/null; then
-        log_message "Relay already running (PID: $pid), skipping this run"
-        exit 0
-    else
-        log_message "Stale lock file found, removing..."
-        rm -f "$LOCK_FILE"
+    # This is optional - only set up if specific ports need to be opened
+    # for the dashboard server or other services
+    
+    if command -v ufw &> /dev/null; then
+        # Ubuntu/Debian UFW
+        log_info "UFW detected - you may need to configure firewall rules manually"
+    elif command -v firewall-cmd &> /dev/null; then
+        # CentOS/RHEL firewalld
+        log_info "Firewalld detected - you may need to configure firewall rules manually"
     fi
-fi
-
-# Create lock file
-echo $$ > "$LOCK_FILE"
-
-# Ensure status directory exists
-mkdir -p "$STATUS_DIR"
-
-# Generate unique run ID
-RUN_ID="cron-$(date +'%Y%m%d-%H%M%S')-$$"
-STATUS_FILE="$STATUS_DIR/status-$RUN_ID.json"
-
-log_message "Starting relay service (Run ID: $RUN_ID)"
-
-# Change to app directory
-cd "$APP_DIR" || {
-    log_message "ERROR: Cannot change to app directory: $APP_DIR"
-    rm -f "$LOCK_FILE"
-    exit 1
+    
+    log_info "Firewall check completed"
 }
 
-# Run the relay service
-timeout 300 node src/app.js 2>&1 | tee -a "$LOG_DIR/cron.log"
-EXIT_CODE=${PIPESTATUS[0]}
-
-# Check results
-if [[ $EXIT_CODE -eq 0 ]]; then
-    log_message "Relay service completed successfully (Run ID: $RUN_ID)"
-elif [[ $EXIT_CODE -eq 124 ]]; then
-    log_message "Relay service timed out after 5 minutes (Run ID: $RUN_ID)"
-else
-    log_message "Relay service failed with exit code $EXIT_CODE (Run ID: $RUN_ID)"
-fi
-
-# Clean up old status files (keep last 24)
-find "$STATUS_DIR" -name "status-*.json" -mtime +1 -delete 2>/dev/null || true
-
-# Remove lock file
-rm -f "$LOCK_FILE"
-
-log_message "Cron job completed (Run ID: $RUN_ID, Exit Code: $EXIT_CODE)"
-exit $EXIT_CODE
-EOF
+# Start services
+start_services() {
+    log_info "Starting services..."
     
-    sudo mv /tmp/tcp-serial-relay-cron.sh $APP_DIR/scripts/
-    sudo chmod +x $APP_DIR/scripts/tcp-serial-relay-cron.sh
-    sudo chown $APP_USER:$APP_USER $APP_DIR/scripts/tcp-serial-relay-cron.sh
+    # Start the systemd service
+    systemctl start ${SERVICE_NAME}
     
-    # Add to crontab for the app user
-    log "Adding cron job for user $APP_USER..."
+    # Wait a moment for startup
+    sleep 3
     
-    # Create crontab entry
-    echo "0 * * * * $APP_DIR/scripts/tcp-serial-relay-cron.sh" | sudo -u $APP_USER crontab -
-    
-    log "Cron job installed: runs every hour at minute 0"
+    # Check status
+    if systemctl is-active --quiet ${SERVICE_NAME}; then
+        log_success "Service started successfully"
+        
+        # Show PM2 status
+        sudo -u "$APP_USER" pm2 status
+    else
+        log_error "Service failed to start"
+        systemctl status ${SERVICE_NAME}
+        exit 1
+    fi
 }
 
-# Setup log rotation
-setup_logrotate() {
-    log "Setting up log rotation..."
-    
-    cat > /tmp/$APP_NAME << EOF
-$LOG_DIR/*.log {
-    daily
-    rotate 30
-    compress
-    delaycompress
-    missingok
-    notifempty
-    create 0644 $APP_USER $APP_USER
-    postrotate
-        # Signal application to reopen log files if needed
-        /bin/true
-    endscript
-}
-
-$APP_DIR/logs/*.log {
-    daily
-    rotate 14
-    compress
-    delaycompress
-    missingok
-    notifempty
-    create 0644 $APP_USER $APP_USER
-}
-EOF
-    
-    sudo mv /tmp/$APP_NAME /etc/logrotate.d/
-    sudo chmod 644 /etc/logrotate.d/$APP_NAME
-}
-
-# Create monitoring script
-create_monitoring_script() {
-    log "Creating monitoring script..."
-    
-    cat > /tmp/monitor.sh << 'EOF'
-#!/bin/bash
-
-# TCP-Serial Relay Monitoring Script
-
-APP_DIR="/opt/tcp-serial-relay"
-LOG_DIR="/var/log/tcp-serial-relay"
-STATUS_DIR="$APP_DIR/status"
-
-# Colors
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-echo "=== TCP-Serial Relay Monitor ==="
-echo "Date: $(date)"
-echo
-
-# Check if cron job is configured
-echo "Cron Job Status:"
-if sudo -u relay crontab -l 2>/dev/null | grep -q "tcp-serial-relay-cron.sh"; then
-    echo -e "${GREEN}✓ Cron job configured${NC}"
-    echo "Schedule: $(sudo -u relay crontab -l | grep tcp-serial-relay-cron.sh)"
-else
-    echo -e "${RED}✗ Cron job not configured${NC}"
-fi
-
-echo
-
-# Check recent log activity
-echo "Recent Activity:"
-if [[ -f "$LOG_DIR/cron.log" ]]; then
-    echo "Last 5 cron entries:"
-    tail -n 5 "$LOG_DIR/cron.log" | while read line; do
-        if echo "$line" | grep -q "completed successfully"; then
-            echo -e "${GREEN}$line${NC}"
-        elif echo "$line" | grep -q "failed\|ERROR"; then
-            echo -e "${RED}$line${NC}"
-        else
-            echo "$line"
-        fi
-    done
-else
-    echo -e "${YELLOW}No cron log found${NC}"
-fi
-
-echo
-
-# Check disk usage
-echo "Disk Usage:"
-df -h "$LOG_DIR" 2>/dev/null || df -h /
-
-echo
-
-# Check serial ports
-echo "Available Serial Ports:"
-if command -v node &> /dev/null; then
-    cd "$APP_DIR" && node -e "
-        const SerialClient = require('./src/services/serial-client');
-        SerialClient.listPorts()
-            .then(ports => {
-                if (ports.length === 0) {
-                    console.log('No serial ports found');
-                } else {
-                    ports.forEach(port => {
-                        console.log(\`\${port.path} - \${port.manufacturer || 'Unknown'}\`);
-                    });
-                }
-            })
-            .catch(err => console.log('Error listing ports:', err.message));
-    " 2>/dev/null || echo "Cannot list serial ports"
-else
-    echo "Node.js not available"
-fi
-
-echo
-
-# Show recent status files
-echo "Recent Status Files:"
-if [[ -d "$STATUS_DIR" ]]; then
-    ls -la "$STATUS_DIR"/status-*.json 2>/dev/null | tail -5 || echo "No status files found"
-else
-    echo "Status directory not found"
-fi
-EOF
-    
-    sudo mv /tmp/monitor.sh $APP_DIR/scripts/
-    sudo chmod +x $APP_DIR/scripts/monitor.sh
-    sudo chown root:root $APP_DIR/scripts/monitor.sh
-}
-
-# Display completion message
-show_completion_message() {
-    log "Installation completed successfully!"
+# Print installation summary
+print_summary() {
     echo
-    echo -e "${BLUE}=== Installation Summary ===${NC}"
-    echo "Application installed to: $APP_DIR"
-    echo "Configuration directory: $CONFIG_DIR"
-    echo "Log directory: $LOG_DIR"
-    echo "Service user: $APP_USER"
+    log_success "=========================================="
+    log_success "Installation completed successfully!"
+    log_success "=========================================="
     echo
-    echo -e "${BLUE}=== Next Steps ===${NC}"
-    echo "1. Edit configuration: sudo nano $CONFIG_DIR/relay-config.json"
-    echo "2. Test the service: sudo -u $APP_USER $APP_DIR/scripts/tcp-serial-relay-cron.sh"
-    echo "3. Monitor activity: sudo $APP_DIR/scripts/monitor.sh"
-    echo "4. View logs: tail -f $LOG_DIR/cron.log"
+    echo -e "${BLUE}Service Details:${NC}"
+    echo "  - Service Name: $SERVICE_NAME"
+    echo "  - Application Directory: $APP_DIR"
+    echo "  - Configuration Directory: $CONFIG_DIR"
+    echo "  - Log Directory: $LOG_DIR"
+    echo "  - User: $APP_USER"
     echo
-    echo -e "${BLUE}=== Cron Schedule ===${NC}"
-    echo "The service will run automatically every hour at minute 0"
-    echo "Check cron status: sudo -u $APP_USER crontab -l"
+    echo -e "${BLUE}Useful Commands:${NC}"
+    echo "  - Check service status: systemctl status $SERVICE_NAME"
+    echo "  - View logs: journalctl -u $SERVICE_NAME -f"
+    echo "  - PM2 status: sudo -u $APP_USER pm2 status"
+    echo "  - View PM2 logs: sudo -u $APP_USER pm2 logs"
+    echo "  - Edit configuration: nano $CONFIG_DIR/relay-config.json"
+    echo "  - Restart service: systemctl restart $SERVICE_NAME"
     echo
-    echo -e "${YELLOW}Note: Make sure to configure your TCP server IP and serial port in the config file!${NC}"
+    echo -e "${YELLOW}Next Steps:${NC}"
+    echo "  1. Edit the configuration file: $CONFIG_DIR/relay-config.json"
+    echo "  2. Restart the service: systemctl restart $SERVICE_NAME"
+    echo "  3. Monitor the logs: journalctl -u $SERVICE_NAME -f"
+    echo
+    echo -e "${YELLOW}Note:${NC} Make sure your serial ports and network settings are correct"
+    echo "in the configuration file before starting operations."
+    echo
 }
 
 # Main installation function
 main() {
-    log "Starting TCP-Serial Relay installation for Raspberry Pi..."
+    echo
+    log_info "=========================================="
+    log_info "TCP-Serial Relay IoT Installation Script"
+    log_info "=========================================="
+    echo
     
     check_root
-    check_raspberry_pi
-    install_dependencies
-    create_user
+    detect_distro
+    install_system_deps
+    install_nodejs
+    install_pm2
+    create_app_user
     create_directories
-    install_application
-    configure_application
-    setup_systemd_service
-    setup_cron
-    setup_logrotate
-    create_monitoring_script
-    show_completion_message
+    copy_app_files
+    install_node_deps
+    create_config
+    create_pm2_config
+    setup_udev_rules
+    setup_log_rotation
+    create_systemd_service
+    setup_firewall
+    start_services
+    print_summary
 }
 
 # Run main function
