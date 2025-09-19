@@ -192,8 +192,8 @@ create_directories() {
 copy_app_files() {
     log_info "Copying application files..."
     
-    # Determine source directory (where this script is located)
-    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+    # Determine source directory (project root - parent of scripts directory)
+    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
     
     # Copy main application files
     cp -r "$SCRIPT_DIR"/* "$APP_DIR/" 2>/dev/null || {
@@ -201,8 +201,8 @@ copy_app_files() {
         exit 1
     }
     
-    # Remove the install script from the app directory
-    rm -f "$APP_DIR/install.sh"
+    # Remove the scripts directory from the app directory since it's not needed in production
+    rm -rf "$APP_DIR/scripts"
     
     # Set ownership
     chown -R "$APP_USER:$APP_USER" "$APP_DIR"
