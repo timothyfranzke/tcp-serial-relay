@@ -65,7 +65,7 @@ install_system_deps() {
     case $DISTRO in
         "ubuntu"|"debian")
             apt-get update
-            apt-get install -y curl wget gnupg2 software-properties-common build-essential
+            apt-get install -y curl wget gnupg2 software-properties-common build-essential sudo
             # For serial port access
             apt-get install -y udev
             ;;
@@ -145,10 +145,7 @@ install_pm2() {
     
     npm install -g pm2
     
-    # Setup PM2 startup script
-    pm2 startup
-    
-    log_success "PM2 installed and configured for startup"
+    log_success "PM2 installed"
 }
 
 # Create application user
@@ -222,8 +219,14 @@ install_node_deps() {
     
     cd "$APP_DIR"
     
-    # Install production dependencies
-    sudo -u "$APP_USER" npm install --production
+    # Install production dependencies as the app user
+    if command -v sudo &> /dev/null; then
+        sudo -u "$APP_USER" npm install --production
+    else
+        # Fallback for systems without sudo - change ownership temporarily
+        chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+        su -s /bin/bash "$APP_USER" -c "cd '$APP_DIR' && npm install --production"
+    fi
     
     log_success "Node.js dependencies installed"
 }
