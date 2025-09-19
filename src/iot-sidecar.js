@@ -55,18 +55,18 @@ class IoTSidecar {
       
       for (const interfaceName of priorityInterfaces) {
         if (networkInterfaces[interfaceName]) {
-          const interface = networkInterfaces[interfaceName].find(net => !net.internal);
-          if (interface && interface.mac && interface.mac !== '00:00:00:00:00:00') {
-            return interface.mac.replace(/:/g, '').toLowerCase();
+          const networkInterface = networkInterfaces[interfaceName].find(net => !net.internal);
+          if (networkInterface && networkInterface.mac && networkInterface.mac !== '00:00:00:00:00:00') {
+            return networkInterface.mac.replace(/:/g, '').toLowerCase();
           }
         }
       }
       
       // Fallback: find any non-internal interface with a valid MAC
       for (const interfaces of Object.values(networkInterfaces)) {
-        const interface = interfaces.find(net => !net.internal && net.mac && net.mac !== '00:00:00:00:00:00');
-        if (interface) {
-          return interface.mac.replace(/:/g, '').toLowerCase();
+        const networkInterface = interfaces.find(net => !net.internal && net.mac && net.mac !== '00:00:00:00:00:00');
+        if (networkInterface) {
+          return networkInterface.mac.replace(/:/g, '').toLowerCase();
         }
       }
       

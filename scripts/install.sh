@@ -288,6 +288,7 @@ module.exports = {
       exec_mode: 'fork',
       cron_restart: '0 * * * *',
       restart_delay: 5000,
+      autorestart: false,
       max_restarts: 10,
       min_uptime: '10s',
       kill_timeout: 5000,
