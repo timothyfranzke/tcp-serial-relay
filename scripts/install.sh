@@ -173,6 +173,7 @@ create_directories() {
     # Create main directories
     mkdir -p "$APP_DIR"
     mkdir -p "$CONFIG_DIR"
+    mkdir -p "$CONFIG_DIR/certs"
     mkdir -p "$LOG_DIR"
     
     # Set ownership
@@ -183,6 +184,7 @@ create_directories() {
     # Set permissions
     chmod 755 "$APP_DIR"
     chmod 755 "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR/certs"  # Secure certs directory
     chmod 755 "$LOG_DIR"
     
     log_success "Directory structure created"
@@ -284,6 +286,7 @@ module.exports = {
       user: '${APP_USER}',
       instances: 1,
       exec_mode: 'fork',
+      cron_restart: '0 * * * *',
       restart_delay: 5000,
       max_restarts: 10,
       min_uptime: '10s',
@@ -295,6 +298,35 @@ module.exports = {
       log_file: '${LOG_DIR}/combined.log',
       out_file: '${LOG_DIR}/out.log',
       error_file: '${LOG_DIR}/error.log',
+      time: true,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+      merge_logs: true,
+      max_log_size: '10M',
+      retain_logs: 10
+    },
+    {
+      name: '${SERVICE_NAME}-iot-sidecar',
+      script: './src/iot-sidecar.js',
+      cwd: '${APP_DIR}',
+      user: '${APP_USER}',
+      instances: 1,
+      exec_mode: 'fork',
+      restart_delay: 5000,
+      max_restarts: 10,
+      min_uptime: '10s',
+      kill_timeout: 5000,
+      env: {
+        NODE_ENV: 'production',
+        CONFIG_PATH: '${CONFIG_DIR}/relay-config.json',
+        IOT_THING_NAME: 'tcp-serial-relay-device',
+        IOT_CERT_PATH: '${CONFIG_DIR}/certs/certificate.pem.crt',
+        IOT_KEY_PATH: '${CONFIG_DIR}/certs/private.pem.key',
+        IOT_CA_PATH: '${CONFIG_DIR}/certs/AmazonRootCA1.pem',
+        IOT_ENDPOINT: ''
+      },
+      log_file: '${LOG_DIR}/iot-sidecar-combined.log',
+      out_file: '${LOG_DIR}/iot-sidecar-out.log',
+      error_file: '${LOG_DIR}/iot-sidecar-error.log',
       time: true,
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
       merge_logs: true,
@@ -363,17 +395,19 @@ Documentation=https://pm2.keymetrics.io/
 After=network.target
 
 [Service]
-Type=notify
+Type=forking
 User=${APP_USER}
 Group=${APP_USER}
 WorkingDirectory=${APP_DIR}
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=HOME=${APP_DIR}
 Environment=PM2_HOME=${APP_DIR}/.pm2
-ExecStart=/usr/bin/pm2 start ${APP_DIR}/ecosystem.config.js --no-daemon
+ExecStart=/usr/bin/pm2 start ${APP_DIR}/ecosystem.config.js
 ExecReload=/usr/bin/pm2 reload ${APP_DIR}/ecosystem.config.js
 ExecStop=/usr/bin/pm2 stop ${APP_DIR}/ecosystem.config.js
 Restart=always
 RestartSec=5
+PIDFile=${APP_DIR}/.pm2/pm2.pid
 
 [Install]
 WantedBy=multi-user.target
@@ -426,6 +460,30 @@ start_services() {
     fi
 }
 
+# Get MAC address for AWS IoT Thing registration
+get_mac_address() {
+    # Try to get MAC address from common network interfaces
+    for interface in eth0 wlan0 en0 enp0s3 ens33; do
+        if [ -d "/sys/class/net/$interface" ]; then
+            MAC=$(cat /sys/class/net/$interface/address 2>/dev/null | tr -d ':' | tr '[:upper:]' '[:lower:]')
+            if [ -n "$MAC" ] && [ "$MAC" != "000000000000" ]; then
+                echo "$MAC"
+                return
+            fi
+        fi
+    done
+    
+    # Fallback: use ip command
+    MAC=$(ip link show | grep -E "link/ether" | head -1 | awk '{print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+    if [ -n "$MAC" ] && [ "$MAC" != "000000000000" ]; then
+        echo "$MAC"
+        return
+    fi
+    
+    # Ultimate fallback
+    echo "unknown"
+}
+
 # Print installation summary
 print_summary() {
     echo
@@ -440,6 +498,12 @@ print_summary() {
     echo "  - Log Directory: $LOG_DIR"
     echo "  - User: $APP_USER"
     echo
+    echo -e "${BLUE}AWS IoT Core Thing Registration:${NC}"
+    DEVICE_MAC=$(get_mac_address)
+    echo "  - Thing Name (MAC Address): $DEVICE_MAC"
+    echo "  - Register this MAC address as a Thing in AWS IoT Core"
+    echo "  - Download certificates and place in: $CONFIG_DIR/certs/"
+    echo
     echo -e "${BLUE}Useful Commands:${NC}"
     echo "  - Check service status: systemctl status $SERVICE_NAME"
     echo "  - View logs: journalctl -u $SERVICE_NAME -f"
@@ -450,11 +514,20 @@ print_summary() {
     echo
     echo -e "${YELLOW}Next Steps:${NC}"
     echo "  1. Edit the configuration file: $CONFIG_DIR/relay-config.json"
-    echo "  2. Restart the service: systemctl restart $SERVICE_NAME"
-    echo "  3. Monitor the logs: journalctl -u $SERVICE_NAME -f"
+    echo "  2. Configure AWS IoT Core certificates in: $CONFIG_DIR/certs/"
+    echo "     - Place certificate.pem.crt, private.pem.key, and AmazonRootCA1.pem"
+    echo "     - Update IOT_ENDPOINT in the ecosystem config"
+    echo "  3. Restart the service: systemctl restart $SERVICE_NAME"
+    echo "  4. Monitor the logs: journalctl -u $SERVICE_NAME -f"
     echo
-    echo -e "${YELLOW}Note:${NC} Make sure your serial ports and network settings are correct"
-    echo "in the configuration file before starting operations."
+    echo -e "${YELLOW}IoT Sidecar Features:${NC}"
+    echo "  - Device Shadow updates for remote config changes"
+    echo "  - Secure tunneling support for remote access"
+    echo "  - Remote command execution (run, stop, restart)"
+    echo "  - Status reporting to AWS IoT Core"
+    echo
+    echo -e "${YELLOW}Note:${NC} Make sure your serial ports, network settings, and IoT certificates"
+    echo "are correct in the configuration files before starting operations."
     echo
 }
 

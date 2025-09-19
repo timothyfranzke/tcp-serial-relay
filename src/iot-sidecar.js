@@ -1,0 +1,577 @@
+// src/iot-sidecar.js
+require('dotenv').config();
+
+const iotDevice = require('aws-iot-device-sdk');
+const { spawn } = require('child_process');
+const fs = require('fs').promises;
+const path = require('path');
+const os = require('os');
+const { v4: uuidv4 } = require('uuid');
+const { logger } = require('./utils/logger');
+const { loadConfig, updateConfig } = require('./config');
+
+/**
+ * AWS IoT Core Sidecar Service
+ * Handles device shadow updates, secure tunneling, and command execution
+ */
+class IoTSidecar {
+  constructor() {
+    this.device = null;
+    this.thingName = process.env.IOT_THING_NAME || this.getMacAddress();
+    this.clientId = process.env.IOT_CLIENT_ID || `tcp-relay-${this.thingName}`;
+    this.config = null;
+    this.relayProcess = null;
+    this.tunnelProcess = null;
+    
+    // Certificate paths
+    this.certPath = process.env.IOT_CERT_PATH || '/opt/tcp-serial-relay/certs/certificate.pem.crt';
+    this.keyPath = process.env.IOT_KEY_PATH || '/opt/tcp-serial-relay/certs/private.pem.key';
+    this.caPath = process.env.IOT_CA_PATH || '/opt/tcp-serial-relay/certs/AmazonRootCA1.pem';
+    this.endpoint = process.env.IOT_ENDPOINT;
+    
+    // State tracking
+    this.shadowState = {
+      reported: {
+        status: 'initializing',
+        version: '1.0.0',
+        uptime: 0,
+        lastRestart: new Date().toISOString()
+      },
+      desired: {}
+    };
+    
+    this.startTime = Date.now();
+  }
+
+  /**
+   * Get the MAC address of the primary network interface
+   */
+  getMacAddress() {
+    try {
+      const networkInterfaces = os.networkInterfaces();
+      
+      // Priority order: eth0, wlan0, en0, then any other interface
+      const priorityInterfaces = ['eth0', 'wlan0', 'en0'];
+      
+      for (const interfaceName of priorityInterfaces) {
+        if (networkInterfaces[interfaceName]) {
+          const interface = networkInterfaces[interfaceName].find(net => !net.internal);
+          if (interface && interface.mac && interface.mac !== '00:00:00:00:00:00') {
+            return interface.mac.replace(/:/g, '').toLowerCase();
+          }
+        }
+      }
+      
+      // Fallback: find any non-internal interface with a valid MAC
+      for (const interfaces of Object.values(networkInterfaces)) {
+        const interface = interfaces.find(net => !net.internal && net.mac && net.mac !== '00:00:00:00:00:00');
+        if (interface) {
+          return interface.mac.replace(/:/g, '').toLowerCase();
+        }
+      }
+      
+      // Ultimate fallback
+      return 'tcp-relay-unknown';
+    } catch (error) {
+      logger.warn('Could not determine MAC address', { error: error.message });
+      return 'tcp-relay-fallback';
+    }
+  }
+
+  /**
+   * Initialize the IoT sidecar service
+   */
+  async init() {
+    try {
+      logger.info('Initializing IoT Sidecar', {
+        thingName: this.thingName,
+        clientId: this.clientId,
+        endpoint: this.endpoint
+      });
+
+      // Validate certificate files exist
+      await this.validateCertificates();
+      
+      // Load current config
+      await this.loadCurrentConfig();
+      
+      // Connect to AWS IoT Core
+      await this.connectToIoT();
+      
+      // Setup periodic shadow updates
+      this.startPeriodicUpdates();
+      
+      logger.info('IoT Sidecar initialized successfully');
+      
+    } catch (error) {
+      logger.error('Failed to initialize IoT Sidecar', { error: error.message });
+      throw error;
+    }
+  }
+
+  /**
+   * Validate that certificate files exist
+   */
+  async validateCertificates() {
+    const certs = [
+      { name: 'Certificate', path: this.certPath },
+      { name: 'Private Key', path: this.keyPath },
+      { name: 'CA Certificate', path: this.caPath }
+    ];
+
+    for (const cert of certs) {
+      try {
+        await fs.access(cert.path);
+        logger.info(`${cert.name} found at ${cert.path}`);
+      } catch (error) {
+        throw new Error(`${cert.name} not found at ${cert.path}`);
+      }
+    }
+  }
+
+  /**
+   * Load current application config
+   */
+  async loadCurrentConfig() {
+    try {
+      this.config = await loadConfig();
+      logger.info('Current config loaded for IoT reporting');
+    } catch (error) {
+      logger.warn('Could not load config for IoT reporting', { error: error.message });
+      this.config = {};
+    }
+  }
+
+  /**
+   * Connect to AWS IoT Core
+   */
+  async connectToIoT() {
+    return new Promise((resolve, reject) => {
+      this.device = iotDevice.device({
+        keyPath: this.keyPath,
+        certPath: this.certPath,
+        caPath: this.caPath,
+        clientId: this.clientId,
+        host: this.endpoint,
+        debug: process.env.NODE_ENV === 'development'
+      });
+
+      // Connection events
+      this.device.on('connect', () => {
+        logger.info('Connected to AWS IoT Core');
+        this.setupSubscriptions();
+        this.updateShadowState({ status: 'connected' });
+        resolve();
+      });
+
+      this.device.on('close', () => {
+        logger.warn('Disconnected from AWS IoT Core');
+        this.updateShadowState({ status: 'disconnected' });
+      });
+
+      this.device.on('reconnect', () => {
+        logger.info('Reconnected to AWS IoT Core');
+        this.updateShadowState({ status: 'connected' });
+      });
+
+      this.device.on('error', (error) => {
+        logger.error('AWS IoT Core connection error', { error: error.message });
+        reject(error);
+      });
+
+      // Set connection timeout
+      setTimeout(() => {
+        if (!this.device.isConnected) {
+          reject(new Error('IoT connection timeout'));
+        }
+      }, 30000);
+    });
+  }
+
+  /**
+   * Setup MQTT subscriptions
+   */
+  setupSubscriptions() {
+    // Subscribe to device shadow delta (desired state changes)
+    this.device.on('delta', (thingName, stateObject) => {
+      logger.info('Received shadow delta', { thingName, stateObject });
+      this.handleShadowDelta(stateObject);
+    });
+
+    // Subscribe to tunnel notifications
+    const tunnelTopic = `$aws/things/${this.thingName}/tunnels/notify`;
+    this.device.subscribe(tunnelTopic);
+    
+    this.device.on('message', (topic, payload) => {
+      if (topic === tunnelTopic) {
+        this.handleTunnelNotification(JSON.parse(payload.toString()));
+      } else {
+        logger.info('Received message', { topic, payload: payload.toString() });
+      }
+    });
+
+    // Subscribe to command topic
+    const commandTopic = `cmd/${this.thingName}`;
+    this.device.subscribe(commandTopic);
+    
+    this.device.on('message', (topic, payload) => {
+      if (topic === commandTopic) {
+        this.handleCommand(JSON.parse(payload.toString()));
+      }
+    });
+
+    logger.info('MQTT subscriptions established', {
+      tunnelTopic,
+      commandTopic,
+      shadowTopic: `$aws/things/${this.thingName}/shadow/update/delta`
+    });
+  }
+
+  /**
+   * Handle device shadow delta (desired state changes)
+   */
+  async handleShadowDelta(stateObject) {
+    try {
+      const { state } = stateObject;
+      
+      if (state.config) {
+        logger.info('Updating config from shadow', { newConfig: state.config });
+        await this.updateConfigFromShadow(state.config);
+      }
+      
+      if (state.command) {
+        logger.info('Executing command from shadow', { command: state.command });
+        await this.executeCommand(state.command);
+      }
+      
+      // Report back the changes
+      this.updateShadowState(state, true);
+      
+    } catch (error) {
+      logger.error('Error handling shadow delta', { error: error.message });
+    }
+  }
+
+  /**
+   * Update config from shadow desired state
+   */
+  async updateConfigFromShadow(newConfig) {
+    try {
+      // Merge with existing config
+      const updatedConfig = { ...this.config, ...newConfig };
+      
+      // Update the config file
+      await updateConfig(updatedConfig);
+      this.config = updatedConfig;
+      
+      logger.info('Config updated from IoT shadow');
+      
+      // If relay is running, restart it with new config
+      if (this.relayProcess) {
+        logger.info('Restarting relay process with updated config');
+        await this.stopRelayProcess();
+        await this.startRelayProcess();
+      }
+      
+    } catch (error) {
+      logger.error('Failed to update config from shadow', { error: error.message });
+      throw error;
+    }
+  }
+
+  /**
+   * Handle secure tunnel notifications
+   */
+  handleTunnelNotification(notification) {
+    logger.info('Received tunnel notification', notification);
+    
+    const { clientAccessToken, region, clientMode } = notification;
+    
+    if (clientMode === 'destination') {
+      this.startTunnel(clientAccessToken, region);
+    } else {
+      logger.warn('Unexpected tunnel client mode', { clientMode });
+    }
+  }
+
+  /**
+   * Start secure tunnel
+   */
+  startTunnel(token, region) {
+    try {
+      // Stop existing tunnel if running
+      if (this.tunnelProcess) {
+        this.tunnelProcess.kill();
+      }
+      
+      const localProxyPath = process.env.LOCAL_PROXY_PATH || './localproxy';
+      
+      this.tunnelProcess = spawn(localProxyPath, [
+        '-m', 'destination',
+        '-r', region,
+        '-t', token
+      ], {
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+      
+      this.tunnelProcess.stdout.on('data', (data) => {
+        logger.info('Tunnel stdout', { output: data.toString() });
+      });
+      
+      this.tunnelProcess.stderr.on('data', (data) => {
+        logger.warn('Tunnel stderr', { output: data.toString() });
+      });
+      
+      this.tunnelProcess.on('close', (code) => {
+        logger.info('Tunnel process closed', { code });
+        this.tunnelProcess = null;
+      });
+      
+      this.tunnelProcess.on('error', (error) => {
+        logger.error('Tunnel process error', { error: error.message });
+        this.tunnelProcess = null;
+      });
+      
+      logger.info('Secure tunnel started', { region });
+      this.updateShadowState({ tunnelStatus: 'active' });
+      
+    } catch (error) {
+      logger.error('Failed to start tunnel', { error: error.message });
+    }
+  }
+
+  /**
+   * Handle direct commands
+   */
+  async handleCommand(commandData) {
+    const { command, parameters = {} } = commandData;
+    
+    logger.info('Processing command', { command, parameters });
+    
+    try {
+      switch (command) {
+        case 'run':
+          await this.startRelayProcess();
+          break;
+          
+        case 'stop':
+          await this.stopRelayProcess();
+          break;
+          
+        case 'restart':
+          await this.stopRelayProcess();
+          await this.startRelayProcess();
+          break;
+          
+        case 'update_config':
+          if (parameters.config) {
+            await this.updateConfigFromShadow(parameters.config);
+          }
+          break;
+          
+        case 'get_status':
+          this.reportStatus();
+          break;
+          
+        default:
+          logger.warn('Unknown command', { command });
+      }
+      
+    } catch (error) {
+      logger.error('Command execution failed', { command, error: error.message });
+    }
+  }
+
+  /**
+   * Execute command (legacy shadow command support)
+   */
+  async executeCommand(command) {
+    await this.handleCommand({ command });
+  }
+
+  /**
+   * Start the main relay process
+   */
+  async startRelayProcess() {
+    if (this.relayProcess) {
+      logger.warn('Relay process already running');
+      return;
+    }
+    
+    try {
+      const appPath = path.join(__dirname, 'app.js');
+      
+      this.relayProcess = spawn('node', [appPath], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          CONFIG_PATH: process.env.CONFIG_PATH
+        }
+      });
+      
+      this.relayProcess.stdout.on('data', (data) => {
+        logger.info('Relay stdout', { output: data.toString() });
+      });
+      
+      this.relayProcess.stderr.on('data', (data) => {
+        logger.warn('Relay stderr', { output: data.toString() });
+      });
+      
+      this.relayProcess.on('close', (code) => {
+        logger.info('Relay process closed', { code });
+        this.relayProcess = null;
+        this.updateShadowState({ relayStatus: 'stopped' });
+      });
+      
+      this.relayProcess.on('error', (error) => {
+        logger.error('Relay process error', { error: error.message });
+        this.relayProcess = null;
+        this.updateShadowState({ relayStatus: 'error' });
+      });
+      
+      logger.info('Relay process started');
+      this.updateShadowState({ relayStatus: 'running' });
+      
+    } catch (error) {
+      logger.error('Failed to start relay process', { error: error.message });
+      throw error;
+    }
+  }
+
+  /**
+   * Stop the relay process
+   */
+  async stopRelayProcess() {
+    if (!this.relayProcess) {
+      logger.info('No relay process to stop');
+      return;
+    }
+    
+    return new Promise((resolve) => {
+      this.relayProcess.on('close', () => {
+        this.relayProcess = null;
+        logger.info('Relay process stopped');
+        this.updateShadowState({ relayStatus: 'stopped' });
+        resolve();
+      });
+      
+      this.relayProcess.kill('SIGTERM');
+      
+      // Force kill after 10 seconds
+      setTimeout(() => {
+        if (this.relayProcess) {
+          this.relayProcess.kill('SIGKILL');
+        }
+      }, 10000);
+    });
+  }
+
+  /**
+   * Update device shadow state
+   */
+  updateShadowState(updates, clearDesired = false) {
+    this.shadowState.reported = {
+      ...this.shadowState.reported,
+      ...updates,
+      timestamp: new Date().toISOString(),
+      uptime: Date.now() - this.startTime
+    };
+    
+    const shadowUpdate = {
+      state: {
+        reported: this.shadowState.reported
+      }
+    };
+    
+    if (clearDesired) {
+      shadowUpdate.state.desired = null;
+    }
+    
+    this.device.publish(`$aws/things/${this.thingName}/shadow/update`, JSON.stringify(shadowUpdate));
+    
+    logger.debug('Shadow state updated', { updates });
+  }
+
+  /**
+   * Report current status
+   */
+  reportStatus() {
+    const status = {
+      status: 'online',
+      relayStatus: this.relayProcess ? 'running' : 'stopped',
+      tunnelStatus: this.tunnelProcess ? 'active' : 'inactive',
+      config: this.config,
+      uptime: Date.now() - this.startTime,
+      memory: process.memoryUsage(),
+      version: require('../package.json').version
+    };
+    
+    this.updateShadowState(status);
+  }
+
+  /**
+   * Start periodic status updates
+   */
+  startPeriodicUpdates() {
+    // Update shadow every 5 minutes
+    setInterval(() => {
+      this.reportStatus();
+    }, 5 * 60 * 1000);
+    
+    // Initial status report
+    setTimeout(() => {
+      this.reportStatus();
+    }, 5000);
+  }
+
+  /**
+   * Shutdown the sidecar service
+   */
+  async shutdown() {
+    logger.info('Shutting down IoT Sidecar');
+    
+    this.updateShadowState({ status: 'shutting_down' });
+    
+    if (this.relayProcess) {
+      await this.stopRelayProcess();
+    }
+    
+    if (this.tunnelProcess) {
+      this.tunnelProcess.kill();
+    }
+    
+    if (this.device) {
+      this.device.end();
+    }
+    
+    logger.info('IoT Sidecar shutdown complete');
+  }
+}
+
+// Main execution
+async function main() {
+  const sidecar = new IoTSidecar();
+  
+  // Graceful shutdown handling
+  const shutdown = async () => {
+    await sidecar.shutdown();
+    process.exit(0);
+  };
+  
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  
+  try {
+    await sidecar.init();
+    logger.info('IoT Sidecar running');
+  } catch (error) {
+    logger.error('IoT Sidecar failed to start', { error: error.message });
+    process.exit(1);
+  }
+}
+
+if (require.main === module) {
+  main().catch(console.error);
+}
+
+module.exports = { IoTSidecar };
