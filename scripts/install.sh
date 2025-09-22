@@ -68,8 +68,8 @@ install_system_deps() {
             apt-get install -y curl wget gnupg2 software-properties-common build-essential sudo git cmake
             # For serial port access
             apt-get install -y udev
-            # Dependencies for AWS IoT Local Proxy
-            apt-get install -y libboost-all-dev libprotobuf-dev protobuf-compiler libssl-dev zlib1g-dev
+            # Dependencies for AWS IoT Local Proxy (except protobuf - will install newer version separately)
+            apt-get install -y libboost-all-dev libssl-dev zlib1g-dev
             ;;
         "centos"|"rhel"|"fedora")
             if command -v dnf &> /dev/null; then
@@ -96,6 +96,69 @@ install_system_deps() {
     esac
     
     log_success "System dependencies installed"
+}
+
+# Install newer protobuf for Ubuntu/Debian
+install_protobuf() {
+    if [[ "$DISTRO" == "ubuntu" || "$DISTRO" == "debian" ]]; then
+        log_info "Installing newer protobuf for AWS IoT Local Proxy compatibility..."
+        
+        # Check current protobuf version
+        if command -v protoc &> /dev/null; then
+            PROTOC_VERSION=$(protoc --version | awk '{print $2}')
+            log_info "Current protobuf version: $PROTOC_VERSION"
+            
+            # Check if version is acceptable (3.17.3+)
+            if [[ "$PROTOC_VERSION" > "3.17.2" ]] || [[ "$PROTOC_VERSION" == "3.17.3" ]]; then
+                log_success "Protobuf version is acceptable"
+                return 0
+            fi
+        fi
+        
+        # Remove old protobuf
+        log_info "Removing old protobuf version..."
+        apt-get remove -y libprotobuf-dev protobuf-compiler 2>/dev/null || true
+        
+        # Try PPA first
+        log_info "Attempting to install newer protobuf from PPA..."
+        if add-apt-repository ppa:maarten-fonville/protobuf -y 2>/dev/null; then
+            apt-get update
+            if apt-get install -y protobuf-compiler libprotobuf-dev; then
+                log_success "Protobuf installed from PPA"
+                return 0
+            fi
+        fi
+        
+        # Fallback: build from source
+        log_info "Building protobuf from source (this may take several minutes)..."
+        
+        TEMP_PROTOBUF_DIR="/tmp/protobuf-build"
+        rm -rf "$TEMP_PROTOBUF_DIR"
+        mkdir -p "$TEMP_PROTOBUF_DIR"
+        cd "$TEMP_PROTOBUF_DIR"
+        
+        # Download protobuf source
+        wget https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protobuf-cpp-3.21.12.tar.gz
+        tar -xzf protobuf-cpp-3.21.12.tar.gz
+        cd protobuf-3.21.12
+        
+        # Configure and build
+        ./configure --prefix=/usr/local
+        make -j$(nproc 2>/dev/null || echo 2)
+        make install
+        ldconfig
+        
+        # Update PKG_CONFIG_PATH
+        export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
+        
+        # Clean up
+        cd /
+        rm -rf "$TEMP_PROTOBUF_DIR"
+        
+        log_success "Protobuf built and installed from source"
+    else
+        log_info "Skipping protobuf installation for non-Ubuntu/Debian system"
+    fi
 }
 
 # Install Node.js
@@ -604,6 +667,7 @@ main() {
     check_root
     detect_distro
     install_system_deps
+    install_protobuf
     install_nodejs
     install_pm2
     create_app_user
