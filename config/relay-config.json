@@ -1,7 +1,7 @@
 {
   "tcpIp": "3.134.10.80",
   "tcpPort": 10001,
-  "connectionType": "tcp",
+  "connectionType": "serial",
   "serialPath": "/dev/ttyUSB0",
   "serialBaud": 9600,
   "serialParity": "none",
@@ -9,7 +9,7 @@
   "serialStopBits": 2,
   "secondaryTcpIp": "0.0.0.0",
   "secondaryTcpPort": 10003,
-  "maxRetries": 3,
+  "maxRetries": 4,
   "retryDelay": 5000,
   "connectionTimeout": 10000,
   "relayTimeout": 30000,
