@@ -18,7 +18,7 @@ class IoTSidecar {
   constructor() {
     this.device = null;
     this.thingName = process.env.IOT_THING_NAME || this.getMacAddress();
-    this.clientId = process.env.IOT_CLIENT_ID || `tcp-relay-${this.thingName}`;
+    this.clientId = process.env.IOT_CLIENT_ID || `${this.thingName}`;
     this.config = null;
     this.relayProcess = null;
     this.tunnelProcess = null;
@@ -110,9 +110,14 @@ class IoTSidecar {
   }
 
   /**
-   * Validate that certificate files exist
+   * Validate that certificate files exist and IoT endpoint is configured
    */
   async validateCertificates() {
+    // Check if IoT endpoint is configured
+    if (!this.endpoint) {
+      throw new Error('IOT_ENDPOINT environment variable is not set. Please configure your AWS IoT Core endpoint.');
+    }
+
     const certs = [
       { name: 'Certificate', path: this.certPath },
       { name: 'Private Key', path: this.keyPath },
@@ -124,9 +129,17 @@ class IoTSidecar {
         await fs.access(cert.path);
         logger.info(`${cert.name} found at ${cert.path}`);
       } catch (error) {
-        throw new Error(`${cert.name} not found at ${cert.path}`);
+        throw new Error(`${cert.name} not found at ${cert.path}. Please place your AWS IoT certificates in the certs directory.`);
       }
     }
+
+    logger.info('IoT certificates validated successfully', {
+      endpoint: this.endpoint,
+      thingName: this.thingName,
+      certPath: this.certPath,
+      keyPath: this.keyPath,
+      caPath: this.caPath
+    });
   }
 
   /**
@@ -198,25 +211,42 @@ class IoTSidecar {
       this.handleShadowDelta(stateObject);
     });
 
+    const deltaTopic = `$aws/things/${this.thingName}/shadow/update/delta`;
+    this.device.subscribe(deltaTopic);
+    
     // Subscribe to tunnel notifications
     const tunnelTopic = `$aws/things/${this.thingName}/tunnels/notify`;
     this.device.subscribe(tunnelTopic);
-    
-    this.device.on('message', (topic, payload) => {
-      if (topic === tunnelTopic) {
-        this.handleTunnelNotification(JSON.parse(payload.toString()));
-      } else {
-        logger.info('Received message', { topic, payload: payload.toString() });
-      }
-    });
 
     // Subscribe to command topic
     const commandTopic = `cmd/${this.thingName}`;
     this.device.subscribe(commandTopic);
+
+    const helloWorldTopic = `hello/world`;
+    this.device.subscribe(helloWorldTopic);
     
+    // Single message handler for all MQTT topics
     this.device.on('message', (topic, payload) => {
-      if (topic === commandTopic) {
-        this.handleCommand(JSON.parse(payload.toString()));
+      logger.info('Received MQTT message', { topic, payload: payload.toString() });
+      
+      try {
+        if (topic === deltaTopic) {
+          this.handleShadowDelta(JSON.parse(payload.toString()));
+        } else if (topic === helloWorldTopic) {
+          logger.info('Received hello/world message', { payload: payload.toString() });
+        } else if (topic === tunnelTopic) {
+          this.handleTunnelNotification(JSON.parse(payload.toString()));
+        } else if (topic === commandTopic) {
+          this.handleCommand(JSON.parse(payload.toString()));
+        } else {
+          logger.info('Unhandled message topic', { topic, payload: payload.toString() });
+        }
+      } catch (error) {
+        logger.error('Error processing MQTT message', { 
+          topic, 
+          payload: payload.toString(), 
+          error: error.message 
+        });
       }
     });
 
@@ -487,9 +517,14 @@ class IoTSidecar {
       shadowUpdate.state.desired = null;
     }
     
-    this.device.publish(`$aws/things/${this.thingName}/shadow/update`, JSON.stringify(shadowUpdate));
+    const shadowTopic = `$aws/things/${this.thingName}/shadow/update`;
+    logger.info('Publishing shadow update', { 
+      topic: shadowTopic, 
+      updates,
+      shadowUpdate 
+    });
     
-    logger.debug('Shadow state updated', { updates });
+    this.device.publish(shadowTopic, JSON.stringify(shadowUpdate));
   }
 
   /**

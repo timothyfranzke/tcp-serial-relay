@@ -65,22 +65,30 @@ install_system_deps() {
     case $DISTRO in
         "ubuntu"|"debian")
             apt-get update
-            apt-get install -y curl wget gnupg2 software-properties-common build-essential sudo
+            apt-get install -y curl wget gnupg2 software-properties-common build-essential sudo git cmake
             # For serial port access
             apt-get install -y udev
+            # Dependencies for AWS IoT Local Proxy
+            apt-get install -y libboost-all-dev libprotobuf-dev protobuf-compiler libssl-dev zlib1g-dev
             ;;
         "centos"|"rhel"|"fedora")
             if command -v dnf &> /dev/null; then
                 dnf update -y
-                dnf install -y curl wget gnupg2 gcc gcc-c++ make
+                dnf install -y curl wget gnupg2 gcc gcc-c++ make git cmake
+                # Dependencies for AWS IoT Local Proxy
+                dnf install -y boost-devel protobuf-devel openssl-devel zlib-devel
             else
                 yum update -y
-                yum install -y curl wget gnupg2 gcc gcc-c++ make
+                yum install -y curl wget gnupg2 gcc gcc-c++ make git cmake
+                # Dependencies for AWS IoT Local Proxy
+                yum install -y boost-devel protobuf-devel openssl-devel zlib-devel
             fi
             ;;
         "alpine")
             apk update
-            apk add --no-cache curl wget gnupg build-base linux-headers udev
+            apk add --no-cache curl wget gnupg build-base linux-headers udev git cmake
+            # Dependencies for AWS IoT Local Proxy
+            apk add --no-cache boost-dev protobuf-dev openssl-dev zlib-dev
             ;;
         *)
             log_warning "Unsupported distribution: $DISTRO. Continuing anyway..."
@@ -146,6 +154,58 @@ install_pm2() {
     npm install -g pm2
     
     log_success "PM2 installed"
+}
+
+# Install AWS IoT Local Proxy
+install_local_proxy() {
+    log_info "Installing AWS IoT Secure Tunneling Local Proxy..."
+    
+    # Check if localproxy already exists
+    if [ -f "$APP_DIR/localproxy" ]; then
+        log_info "Local proxy already exists at $APP_DIR/localproxy"
+        return 0
+    fi
+    
+    # Create temporary build directory
+    TEMP_BUILD_DIR="/tmp/aws-iot-localproxy-build"
+    rm -rf "$TEMP_BUILD_DIR"
+    mkdir -p "$TEMP_BUILD_DIR"
+    
+    cd "$TEMP_BUILD_DIR"
+    
+    # Clone the repository
+    log_info "Cloning AWS IoT Secure Tunneling Local Proxy repository..."
+    git clone https://github.com/aws-samples/aws-iot-securetunneling-localproxy.git
+    
+    cd aws-iot-securetunneling-localproxy
+    
+    # Create build directory and build
+    log_info "Building local proxy (this may take several minutes)..."
+    mkdir build
+    cd build
+    
+    # Configure with CMake
+    cmake ../ -DCMAKE_BUILD_TYPE=Release
+    
+    # Build the project
+    make -j$(nproc 2>/dev/null || echo 2)
+    
+    # Check if build was successful
+    if [ -f "./bin/localproxy" ]; then
+        # Copy the binary to the application directory
+        cp "./bin/localproxy" "$APP_DIR/"
+        chown "$APP_USER:$APP_USER" "$APP_DIR/localproxy"
+        chmod +x "$APP_DIR/localproxy"
+        
+        log_success "Local proxy installed successfully"
+    else
+        log_error "Failed to build local proxy"
+        return 1
+    fi
+    
+    # Clean up temporary build directory
+    cd /
+    rm -rf "$TEMP_BUILD_DIR"
 }
 
 # Create application user
@@ -512,6 +572,7 @@ print_summary() {
     echo "  - View PM2 logs: sudo -u $APP_USER pm2 logs"
     echo "  - Edit configuration: nano $CONFIG_DIR/relay-config.json"
     echo "  - Restart service: systemctl restart $SERVICE_NAME"
+    echo "  - Test local proxy: $APP_DIR/localproxy --help"
     echo
     echo -e "${YELLOW}Next Steps:${NC}"
     echo "  1. Edit the configuration file: $CONFIG_DIR/relay-config.json"
@@ -549,6 +610,7 @@ main() {
     create_directories
     copy_app_files
     install_node_deps
+    install_local_proxy
     create_config
     create_pm2_config
     setup_udev_rules
