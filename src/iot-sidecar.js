@@ -9,6 +9,7 @@ const os = require('os');
 const { v4: uuidv4 } = require('uuid');
 const { logger } = require('./utils/logger');
 const { loadConfig, updateConfig } = require('./config');
+const { UpdateManager } = require('./services/update-manager');
 
 /**
  * AWS IoT Core Sidecar Service
@@ -22,6 +23,10 @@ class IoTSidecar {
     this.config = null;
     this.relayProcess = null;
     this.tunnelProcess = null;
+    this.updateManager = new UpdateManager({
+      appDir: '/opt/tcp-serial-relay',
+      currentVersion: require('../package.json').version
+    });
     
     // Certificate paths
     this.certPath = process.env.IOT_CERT_PATH || '/opt/tcp-serial-relay/certs/certificate.pem.crt';
@@ -41,6 +46,9 @@ class IoTSidecar {
     };
     
     this.startTime = Date.now();
+    this.dockerImage = process.env.DOCKER_IMAGE || 'public.ecr.aws/aws-iot-securetunneling-localproxy/ubuntu-bin';
+    this.dockerTag = process.env.DOCKER_TAG || (process.arch === 'arm' ? 'armv7-latest' : 'arm64-latest');
+    this.destinationPort = process.env.DESTINATION_PORT || '22'; // Default to SSH port; adjust as needed
   }
 
   /**
@@ -225,6 +233,19 @@ class IoTSidecar {
     const helloWorldTopic = `hello/world`;
     this.device.subscribe(helloWorldTopic);
     
+    // Subscribe to AWS IoT Jobs topics
+    const jobNotifyTopic = `$aws/things/${this.thingName}/jobs/notify`;
+    const jobNotifyNextTopic = `$aws/things/${this.thingName}/jobs/notify-next`;
+    const jobGetAcceptedTopic = `$aws/things/${this.thingName}/jobs/+/get/accepted`;
+    const jobUpdateAcceptedTopic = `$aws/things/${this.thingName}/jobs/+/update/accepted`;
+    const jobNextGetAcceptedTopic = `$aws/things/${this.thingName}/jobs/$next/get/accepted`;
+    
+    this.device.subscribe(jobNotifyTopic);
+    this.device.subscribe(jobNotifyNextTopic);
+    this.device.subscribe(jobGetAcceptedTopic);
+    this.device.subscribe(jobUpdateAcceptedTopic);
+    this.device.subscribe(jobNextGetAcceptedTopic);
+    
     // Single message handler for all MQTT topics
     this.device.on('message', (topic, payload) => {
       logger.info('Received MQTT message', { topic, payload: payload.toString() });
@@ -238,6 +259,12 @@ class IoTSidecar {
           this.handleTunnelNotification(JSON.parse(payload.toString()));
         } else if (topic === commandTopic) {
           this.handleCommand(JSON.parse(payload.toString()));
+        } else if (topic.includes('/jobs/notify')) {
+          this.handleJobNotification(JSON.parse(payload.toString()));
+        } else if (topic.includes('/jobs/') && topic.includes('/get/accepted')) {
+          this.handleJobDetails(JSON.parse(payload.toString()));
+        } else if (topic.includes('/jobs/') && topic.includes('/update/accepted')) {
+          this.handleJobUpdateResponse(JSON.parse(payload.toString()));
         } else {
           logger.info('Unhandled message topic', { topic, payload: payload.toString() });
         }
@@ -253,7 +280,12 @@ class IoTSidecar {
     logger.info('MQTT subscriptions established', {
       tunnelTopic,
       commandTopic,
-      shadowTopic: `$aws/things/${this.thingName}/shadow/update/delta`
+      shadowTopic: `$aws/things/${this.thingName}/shadow/update/delta`,
+      jobNotifyTopic,
+      jobNotifyNextTopic,
+      jobGetAcceptedTopic,
+      jobUpdateAcceptedTopic,
+      jobNextGetAcceptedTopic
     });
   }
 
@@ -331,43 +363,86 @@ class IoTSidecar {
     try {
       // Stop existing tunnel if running
       if (this.tunnelProcess) {
-        this.tunnelProcess.kill();
+        this.stopTunnelProcess();
       }
-      
-      const localProxyPath = process.env.LOCAL_PROXY_PATH || './localproxy';
-      
-      this.tunnelProcess = spawn(localProxyPath, [
+
+      // Use environment variable for token to avoid CLI exposure
+      const env = {
+        ...process.env,
+        AWSIOT_TUNNEL_ACCESS_TOKEN: token
+      };
+
+      // Construct Docker command
+      const dockerArgs = [
+        'run',
+        '--rm', // Remove container when it exits
+        '--network=host', // Use host networking
+        '-e', `AWSIOT_TUNNEL_ACCESS_TOKEN=${token}`, // Pass token via env var
+        `${this.dockerImage}:${this.dockerTag}`, // Image and tag
         '-m', 'destination',
         '-r', region,
-        '-t', token
-      ], {
-        stdio: ['ignore', 'pipe', 'pipe']
+        '-d', `localhost:${this.destinationPort}`, // Destination service (e.g., SSH on port 22)
+        '-c', '/etc/ssl/certs', // SSL cert path to avoid handshake issues
+        '-v', '6' // Verbose logging for debugging
+      ];
+
+      this.tunnelProcess = spawn('docker', dockerArgs, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env
       });
-      
+
       this.tunnelProcess.stdout.on('data', (data) => {
         logger.info('Tunnel stdout', { output: data.toString() });
       });
-      
+
       this.tunnelProcess.stderr.on('data', (data) => {
         logger.warn('Tunnel stderr', { output: data.toString() });
       });
-      
+
       this.tunnelProcess.on('close', (code) => {
         logger.info('Tunnel process closed', { code });
         this.tunnelProcess = null;
+        this.updateShadowState({ tunnelStatus: 'inactive' });
       });
-      
+
       this.tunnelProcess.on('error', (error) => {
         logger.error('Tunnel process error', { error: error.message });
         this.tunnelProcess = null;
+        this.updateShadowState({ tunnelStatus: 'error' });
       });
-      
-      logger.info('Secure tunnel started', { region });
+
+      logger.info('Secure tunnel started via Docker', { region, image: `${this.dockerImage}:${this.dockerTag}` });
       this.updateShadowState({ tunnelStatus: 'active' });
-      
+
     } catch (error) {
       logger.error('Failed to start tunnel', { error: error.message });
+      this.updateShadowState({ tunnelStatus: 'error' });
     }
+  }
+
+  stopTunnelProcess() {
+    if (!this.tunnelProcess) {
+      logger.info('No tunnel process to stop');
+      return;
+    }
+
+    return new Promise((resolve) => {
+      this.tunnelProcess.on('close', () => {
+        this.tunnelProcess = null;
+        logger.info('Tunnel process stopped');
+        this.updateShadowState({ tunnelStatus: 'inactive' });
+        resolve();
+      });
+
+      this.tunnelProcess.kill('SIGTERM');
+
+      // Force kill after 10 seconds
+      setTimeout(() => {
+        if (this.tunnelProcess) {
+          this.tunnelProcess.kill('SIGKILL');
+        }
+      }, 10000);
+    });
   }
 
   /**
@@ -531,6 +606,8 @@ class IoTSidecar {
    * Report current status
    */
   reportStatus() {
+    const updateStatus = this.updateManager.getStatus();
+    
     const status = {
       status: 'online',
       relayStatus: this.relayProcess ? 'running' : 'stopped',
@@ -538,10 +615,180 @@ class IoTSidecar {
       config: this.config,
       uptime: Date.now() - this.startTime,
       memory: process.memoryUsage(),
-      version: require('../package.json').version
+      version: updateStatus.currentVersion,
+      updateInProgress: updateStatus.updateInProgress,
+      capabilities: {
+        softwareUpdates: true,
+        secureTunneling: true,
+        remoteConfig: true,
+        remoteCommands: true
+      }
     };
     
     this.updateShadowState(status);
+  }
+
+  /**
+   * Handle AWS IoT Job notifications
+   */
+  async handleJobNotification(notification) {
+    logger.info('Received job notification', notification);
+    
+    try {
+      // Request the next pending job
+      const getJobTopic = `$aws/things/${this.thingName}/jobs/$next/get`;
+      this.device.publish(getJobTopic, JSON.stringify({}));
+      
+      logger.info('Requested next pending job');
+    } catch (error) {
+      logger.error('Error handling job notification', { error: error.message });
+    }
+  }
+
+  /**
+   * Handle AWS IoT Job details
+   */
+  async handleJobDetails(jobData) {
+    const { execution } = jobData;
+    
+    if (!execution) {
+      logger.info('No pending jobs');
+      return;
+    }
+
+    const { jobId, jobDocument, versionNumber } = execution;
+    
+    logger.info('Processing job', { jobId, jobDocument });
+    
+    // Update job status to IN_PROGRESS
+    await this.updateJobStatus(jobId, 'IN_PROGRESS', {
+      message: 'Starting job processing',
+      timestamp: new Date().toISOString()
+    }, versionNumber);
+
+    try {
+      let result;
+      
+      if (jobDocument.operation === 'software_update') {
+        result = await this.processSoftwareUpdate(jobDocument);
+      } else {
+        throw new Error(`Unsupported job operation: ${jobDocument.operation}`);
+      }
+
+      // Update job status to SUCCEEDED
+      await this.updateJobStatus(jobId, 'SUCCEEDED', {
+        message: result.message || 'Job completed successfully',
+        result,
+        timestamp: new Date().toISOString()
+      }, versionNumber);
+      
+      // Update device shadow with new status
+      this.updateShadowState({
+        lastJobId: jobId,
+        lastJobStatus: 'SUCCEEDED',
+        lastJobTimestamp: new Date().toISOString()
+      });
+
+    } catch (error) {
+      logger.error('Job execution failed', { jobId, error: error.message });
+      
+      // Update job status to FAILED
+      await this.updateJobStatus(jobId, 'FAILED', {
+        message: error.message,
+        error: error.stack,
+        timestamp: new Date().toISOString()
+      }, versionNumber);
+      
+      // Update device shadow with error status
+      this.updateShadowState({
+        lastJobId: jobId,
+        lastJobStatus: 'FAILED',
+        lastJobError: error.message,
+        lastJobTimestamp: new Date().toISOString()
+      });
+    }
+  }
+
+  /**
+   * Handle job update responses
+   */
+  handleJobUpdateResponse(response) {
+    logger.info('Received job update response', response);
+  }
+
+  /**
+   * Process software update job
+   */
+  async processSoftwareUpdate(jobDocument) {
+    logger.info('Processing software update job', jobDocument);
+    
+    try {
+      const result = await this.updateManager.processUpdateJob(jobDocument);
+      
+      logger.info('Software update completed successfully', result);
+      
+      // Update shadow with new version
+      this.updateShadowState({
+        version: result.version,
+        updateStatus: 'completed',
+        lastUpdateTimestamp: new Date().toISOString()
+      });
+      
+      return result;
+    } catch (error) {
+      logger.error('Software update failed', { error: error.message });
+      
+      // Update shadow with error status
+      this.updateShadowState({
+        updateStatus: 'failed',
+        updateError: error.message,
+        lastUpdateTimestamp: new Date().toISOString()
+      });
+      
+      throw error;
+    }
+  }
+
+  /**
+   * Update AWS IoT Job status
+   */
+  async updateJobStatus(jobId, status, statusDetails = {}, expectedVersion = 1) {
+    const updateTopic = `$aws/things/${this.thingName}/jobs/${jobId}/update`;
+    
+    const payload = {
+      status,
+      statusDetails,
+      expectedVersion,
+      executionNumber: 1,
+      includeJobExecutionState: true,
+      includeJobDocument: false,
+      stepTimeoutInMinutes: 60
+    };
+    
+    try {
+      this.device.publish(updateTopic, JSON.stringify(payload));
+      logger.info('Updated job status', { jobId, status, statusDetails });
+    } catch (error) {
+      logger.error('Failed to update job status', { 
+        jobId, 
+        status, 
+        error: error.message 
+      });
+    }
+  }
+
+  /**
+   * Check for pending jobs on startup
+   */
+  async checkForPendingJobs() {
+    logger.info('Checking for pending jobs');
+    
+    try {
+      const getJobTopic = `$aws/things/${this.thingName}/jobs/$next/get`;
+      this.device.publish(getJobTopic, JSON.stringify({}));
+    } catch (error) {
+      logger.error('Failed to check for pending jobs', { error: error.message });
+    }
   }
 
   /**
@@ -553,10 +800,20 @@ class IoTSidecar {
       this.reportStatus();
     }, 5 * 60 * 1000);
     
+    // Check for pending jobs every 10 minutes
+    setInterval(() => {
+      this.checkForPendingJobs();
+    }, 10 * 60 * 1000);
+    
     // Initial status report
     setTimeout(() => {
       this.reportStatus();
     }, 5000);
+    
+    // Initial job check
+    setTimeout(() => {
+      this.checkForPendingJobs();
+    }, 10000);
   }
 
   /**
@@ -564,21 +821,21 @@ class IoTSidecar {
    */
   async shutdown() {
     logger.info('Shutting down IoT Sidecar');
-    
+
     this.updateShadowState({ status: 'shutting_down' });
-    
+
     if (this.relayProcess) {
       await this.stopRelayProcess();
     }
-    
+
     if (this.tunnelProcess) {
-      this.tunnelProcess.kill();
+      await this.stopTunnelProcess();
     }
-    
+
     if (this.device) {
       this.device.end();
     }
-    
+
     logger.info('IoT Sidecar shutdown complete');
   }
 }

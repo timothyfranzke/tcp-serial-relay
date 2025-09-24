@@ -58,119 +58,14 @@ detect_distro() {
     log_info "Detected distribution: $DISTRO $VERSION"
 }
 
-# Install system dependencies
-install_system_deps() {
-    log_info "Installing system dependencies..."
-    
-    case $DISTRO in
-        "ubuntu"|"debian")
-            apt-get update
-            apt-get install -y curl wget gnupg2 software-properties-common build-essential sudo git cmake
-            # For serial port access
-            apt-get install -y udev
-            # Dependencies for AWS IoT Local Proxy (except protobuf - will install newer version separately)
-            apt-get install -y libboost-all-dev libssl-dev zlib1g-dev
-            ;;
-        "centos"|"rhel"|"fedora")
-            if command -v dnf &> /dev/null; then
-                dnf update -y
-                dnf install -y curl wget gnupg2 gcc gcc-c++ make git cmake
-                # Dependencies for AWS IoT Local Proxy
-                dnf install -y boost-devel protobuf-devel openssl-devel zlib-devel
-            else
-                yum update -y
-                yum install -y curl wget gnupg2 gcc gcc-c++ make git cmake
-                # Dependencies for AWS IoT Local Proxy
-                yum install -y boost-devel protobuf-devel openssl-devel zlib-devel
-            fi
-            ;;
-        "alpine")
-            apk update
-            apk add --no-cache curl wget gnupg build-base linux-headers udev git cmake
-            # Dependencies for AWS IoT Local Proxy
-            apk add --no-cache boost-dev protobuf-dev openssl-dev zlib-dev
-            ;;
-        *)
-            log_warning "Unsupported distribution: $DISTRO. Continuing anyway..."
-            ;;
-    esac
-    
-    log_success "System dependencies installed"
-}
-
-# Install newer protobuf for Ubuntu/Debian
-install_protobuf() {
-    if [[ "$DISTRO" == "ubuntu" || "$DISTRO" == "debian" ]]; then
-        log_info "Installing newer protobuf for AWS IoT Local Proxy compatibility..."
-        
-        # Check current protobuf version
-        if command -v protoc &> /dev/null; then
-            PROTOC_VERSION=$(protoc --version | awk '{print $2}')
-            log_info "Current protobuf version: $PROTOC_VERSION"
-            
-            # Check if version is acceptable (3.17.3+)
-            if [[ "$PROTOC_VERSION" > "3.17.2" ]] || [[ "$PROTOC_VERSION" == "3.17.3" ]]; then
-                log_success "Protobuf version is acceptable"
-                return 0
-            fi
-        fi
-        
-        # Remove old protobuf
-        log_info "Removing old protobuf version..."
-        apt-get remove -y libprotobuf-dev protobuf-compiler 2>/dev/null || true
-        
-        # Try PPA first
-        log_info "Attempting to install newer protobuf from PPA..."
-        if add-apt-repository ppa:maarten-fonville/protobuf -y 2>/dev/null; then
-            apt-get update
-            if apt-get install -y protobuf-compiler libprotobuf-dev; then
-                log_success "Protobuf installed from PPA"
-                return 0
-            fi
-        fi
-        
-        # Fallback: build from source
-        log_info "Building protobuf from source (this may take several minutes)..."
-        
-        TEMP_PROTOBUF_DIR="/tmp/protobuf-build"
-        rm -rf "$TEMP_PROTOBUF_DIR"
-        mkdir -p "$TEMP_PROTOBUF_DIR"
-        cd "$TEMP_PROTOBUF_DIR"
-        
-        # Download protobuf source
-        wget https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protobuf-cpp-3.21.12.tar.gz
-        tar -xzf protobuf-cpp-3.21.12.tar.gz
-        cd protobuf-3.21.12
-        
-        # Configure and build
-        ./configure --prefix=/usr/local
-        make -j$(nproc 2>/dev/null || echo 2)
-        make install
-        ldconfig
-        
-        # Update PKG_CONFIG_PATH
-        export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
-        
-        # Clean up
-        cd /
-        rm -rf "$TEMP_PROTOBUF_DIR"
-        
-        log_success "Protobuf built and installed from source"
-    else
-        log_info "Skipping protobuf installation for non-Ubuntu/Debian system"
-    fi
-}
-
 # Install Node.js
 install_nodejs() {
     log_info "Installing Node.js..."
     
-    # Check if Node.js is already installed
     if command -v node &> /dev/null; then
         NODE_VERSION=$(node --version)
         log_info "Node.js is already installed: $NODE_VERSION"
         
-        # Check if version is recent enough (v16+)
         if [[ "$NODE_VERSION" < "v16" ]]; then
             log_warning "Node.js version is too old. Installing newer version..."
         else
@@ -179,9 +74,8 @@ install_nodejs() {
         fi
     fi
     
-    # Install Node.js via NodeSource repository
     case $DISTRO in
-        "ubuntu"|"debian")
+        "ubuntu"|"debian"|"raspbian")
             curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
             apt-get install -y nodejs
             ;;
@@ -205,6 +99,50 @@ install_nodejs() {
     log_success "Node.js installed: $(node --version)"
 }
 
+# Install Docker
+install_docker() {
+    log_info "Installing Docker..."
+    
+    if command -v docker &> /dev/null; then
+        DOCKER_VERSION=$(docker --version | awk '{print $3}' | tr -d ',')
+        log_info "Docker is already installed: $DOCKER_VERSION"
+        return 0
+    fi
+    
+    case $DISTRO in
+        "ubuntu"|"debian"|"raspbian")
+            apt-get update
+            apt-get install -y docker.io
+            systemctl enable docker
+            systemctl start docker
+            ;;
+        "centos"|"rhel")
+            yum install -y docker
+            systemctl enable docker
+            systemctl start docker
+            ;;
+        "fedora")
+            dnf install -y docker
+            systemctl enable docker
+            systemctl start docker
+            ;;
+        "alpine")
+            apk add --no-cache docker
+            rc-update add docker boot
+            service docker start
+            ;;
+        *)
+            log_error "Cannot install Docker for distribution: $DISTRO"
+            exit 1
+            ;;
+    esac
+    
+    # Add relay user to docker group
+    usermod -a -G docker "$APP_USER" 2>/dev/null || log_warning "Could not add user to docker group"
+    
+    log_success "Docker installed and configured"
+}
+
 # Install PM2 globally
 install_pm2() {
     log_info "Installing PM2 process manager..."
@@ -219,58 +157,6 @@ install_pm2() {
     log_success "PM2 installed"
 }
 
-# Install AWS IoT Local Proxy
-install_local_proxy() {
-    log_info "Installing AWS IoT Secure Tunneling Local Proxy..."
-    
-    # Check if localproxy already exists
-    if [ -f "$APP_DIR/localproxy" ]; then
-        log_info "Local proxy already exists at $APP_DIR/localproxy"
-        return 0
-    fi
-    
-    # Create temporary build directory
-    TEMP_BUILD_DIR="/tmp/aws-iot-localproxy-build"
-    rm -rf "$TEMP_BUILD_DIR"
-    mkdir -p "$TEMP_BUILD_DIR"
-    
-    cd "$TEMP_BUILD_DIR"
-    
-    # Clone the repository
-    log_info "Cloning AWS IoT Secure Tunneling Local Proxy repository..."
-    git clone https://github.com/aws-samples/aws-iot-securetunneling-localproxy.git
-    
-    cd aws-iot-securetunneling-localproxy
-    
-    # Create build directory and build
-    log_info "Building local proxy (this may take several minutes)..."
-    mkdir build
-    cd build
-    
-    # Configure with CMake
-    cmake ../ -DCMAKE_BUILD_TYPE=Release
-    
-    # Build the project
-    make -j$(nproc 2>/dev/null || echo 2)
-    
-    # Check if build was successful
-    if [ -f "./bin/localproxy" ]; then
-        # Copy the binary to the application directory
-        cp "./bin/localproxy" "$APP_DIR/"
-        chown "$APP_USER:$APP_USER" "$APP_DIR/localproxy"
-        chmod +x "$APP_DIR/localproxy"
-        
-        log_success "Local proxy installed successfully"
-    else
-        log_error "Failed to build local proxy"
-        return 1
-    fi
-    
-    # Clean up temporary build directory
-    cd /
-    rm -rf "$TEMP_BUILD_DIR"
-}
-
 # Create application user
 create_app_user() {
     log_info "Creating application user: $APP_USER"
@@ -280,10 +166,8 @@ create_app_user() {
         return 0
     fi
     
-    # Create user with no login shell and home directory
     useradd --system --home-dir "$APP_DIR" --shell /bin/false --comment "TCP-Serial Relay Service" "$APP_USER"
     
-    # Add user to dialout group for serial port access
     usermod -a -G dialout "$APP_USER" 2>/dev/null || log_warning "Could not add user to dialout group"
     
     log_success "Application user created: $APP_USER"
@@ -293,21 +177,18 @@ create_app_user() {
 create_directories() {
     log_info "Creating directory structure..."
     
-    # Create main directories
     mkdir -p "$APP_DIR"
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$CONFIG_DIR/certs"
     mkdir -p "$LOG_DIR"
     
-    # Set ownership
     chown -R "$APP_USER:$APP_USER" "$APP_DIR"
     chown -R "$APP_USER:$APP_USER" "$CONFIG_DIR"
     chown -R "$APP_USER:$APP_USER" "$LOG_DIR"
     
-    # Set permissions
     chmod 755 "$APP_DIR"
     chmod 755 "$CONFIG_DIR"
-    chmod 700 "$CONFIG_DIR/certs"  # Secure certs directory
+    chmod 700 "$CONFIG_DIR/certs"
     chmod 755 "$LOG_DIR"
     
     log_success "Directory structure created"
@@ -317,22 +198,17 @@ create_directories() {
 copy_app_files() {
     log_info "Copying application files..."
     
-    # Determine source directory (project root - parent of scripts directory)
     SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
     
-    # Copy main application files
     cp -r "$SCRIPT_DIR"/* "$APP_DIR/" 2>/dev/null || {
         log_error "Failed to copy application files. Make sure this script is in the application root directory."
         exit 1
     }
     
-    # Remove the scripts directory from the app directory since it's not needed in production
     rm -rf "$APP_DIR/scripts"
     
-    # Set ownership
     chown -R "$APP_USER:$APP_USER" "$APP_DIR"
     
-    # Make main script executable
     chmod +x "$APP_DIR/src/app.js" 2>/dev/null || chmod +x "$APP_DIR/app.js" 2>/dev/null || true
     
     log_success "Application files copied"
@@ -344,11 +220,9 @@ install_node_deps() {
     
     cd "$APP_DIR"
     
-    # Install production dependencies as the app user
     if command -v sudo &> /dev/null; then
         sudo -u "$APP_USER" npm install --production
     else
-        # Fallback for systems without sudo - change ownership temporarily
         chown -R "$APP_USER:$APP_USER" "$APP_DIR"
         su -s /bin/bash "$APP_USER" -c "cd '$APP_DIR' && npm install --production"
     fi
@@ -360,7 +234,6 @@ install_node_deps() {
 create_config() {
     log_info "Creating default configuration..."
     
-    # Create default config file if it doesn't exist
     if [ ! -f "$CONFIG_DIR/relay-config.json" ]; then
         cat > "$CONFIG_DIR/relay-config.json" << EOF
 {
@@ -398,6 +271,14 @@ EOF
 # Create PM2 ecosystem file
 create_pm2_config() {
     log_info "Creating PM2 ecosystem configuration..."
+    
+    # Determine architecture for Docker tag
+    ARCH=$(uname -m)
+    if [[ "$ARCH" == "arm"* ]]; then
+        DOCKER_TAG="armv7-latest"
+    else
+        DOCKER_TAG="arm64-latest"
+    fi
     
     cat > "$APP_DIR/ecosystem.config.js" << EOF
 module.exports = {
@@ -446,7 +327,10 @@ module.exports = {
         IOT_CERT_PATH: '${CONFIG_DIR}/certs/certificate.pem.crt',
         IOT_KEY_PATH: '${CONFIG_DIR}/certs/private.pem.key',
         IOT_CA_PATH: '${CONFIG_DIR}/certs/AmazonRootCA1.pem',
-        IOT_ENDPOINT: ''
+        IOT_ENDPOINT: 'a35oe2953aualt-ats.iot.us-east-1.amazonaws.com',
+        DOCKER_IMAGE: 'public.ecr.aws/aws-iot-securetunneling-localproxy/ubuntu-bin',
+        DOCKER_TAG: '${DOCKER_TAG}',
+        DESTINATION_PORT: '22'
       },
       log_file: '${LOG_DIR}/iot-sidecar-combined.log',
       out_file: '${LOG_DIR}/iot-sidecar-out.log',
@@ -479,7 +363,6 @@ KERNEL=="ttyACM*", GROUP="dialout", MODE="0664"
 KERNEL=="ttyS*", GROUP="dialout", MODE="0664"
 EOF
     
-    # Reload udev rules
     udevadm control --reload-rules
     udevadm trigger
     
@@ -508,7 +391,7 @@ EOF
     log_success "Log rotation configured"
 }
 
-# Create systemd service for PM2 (alternative to PM2 startup)
+# Create systemd service for PM2
 create_systemd_service() {
     log_info "Creating systemd service..."
     
@@ -516,7 +399,7 @@ create_systemd_service() {
 [Unit]
 Description=TCP-Serial Relay IoT Service
 Documentation=https://pm2.keymetrics.io/
-After=network.target
+After=network.target docker.service
 
 [Service]
 Type=forking
@@ -543,39 +426,35 @@ EOF
     log_success "Systemd service created and enabled"
 }
 
-# Setup firewall rules (if needed)
+# Setup firewall rules
 setup_firewall() {
     log_info "Checking firewall configuration..."
     
-    # This is optional - only set up if specific ports need to be opened
-    # for the dashboard server or other services
-    
     if command -v ufw &> /dev/null; then
-        # Ubuntu/Debian UFW
-        log_info "UFW detected - you may need to configure firewall rules manually"
+        log_info "UFW detected - opening destination port (22) for secure tunneling"
+        ufw allow 22/tcp comment 'TCP-Serial Relay Secure Tunneling'
+        ufw reload
     elif command -v firewall-cmd &> /dev/null; then
-        # CentOS/RHEL firewalld
-        log_info "Firewalld detected - you may need to configure firewall rules manually"
+        log_info "Firewalld detected - opening destination port (22) for secure tunneling"
+        firewall-cmd --permanent --add-port=22/tcp --add-port-comment="TCP-Serial Relay Secure Tunneling"
+        firewall-cmd --reload
+    else
+        log_warning "No supported firewall detected. Ensure port 22 (or your configured DESTINATION_PORT) is open if needed."
     fi
     
-    log_info "Firewall check completed"
+    log_success "Firewall configuration completed"
 }
 
 # Start services
 start_services() {
     log_info "Starting services..."
     
-    # Start the systemd service
     systemctl start ${SERVICE_NAME}
     
-    # Wait a moment for startup
     sleep 3
     
-    # Check status
     if systemctl is-active --quiet ${SERVICE_NAME}; then
         log_success "Service started successfully"
-        
-        # Show PM2 status
         sudo -u "$APP_USER" pm2 status
     else
         log_error "Service failed to start"
@@ -586,7 +465,6 @@ start_services() {
 
 # Get MAC address for AWS IoT Thing registration
 get_mac_address() {
-    # Try to get MAC address from common network interfaces
     for interface in eth0 wlan0 en0 enp0s3 ens33; do
         if [ -d "/sys/class/net/$interface" ]; then
             MAC=$(cat /sys/class/net/$interface/address 2>/dev/null | tr -d ':' | tr '[:upper:]' '[:lower:]')
@@ -597,14 +475,12 @@ get_mac_address() {
         fi
     done
     
-    # Fallback: use ip command
     MAC=$(ip link show | grep -E "link/ether" | head -1 | awk '{print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
     if [ -n "$MAC" ] && [ "$MAC" != "000000000000" ]; then
         echo "$MAC"
         return
     fi
     
-    # Ultimate fallback
     echo "unknown"
 }
 
@@ -635,24 +511,25 @@ print_summary() {
     echo "  - View PM2 logs: sudo -u $APP_USER pm2 logs"
     echo "  - Edit configuration: nano $CONFIG_DIR/relay-config.json"
     echo "  - Restart service: systemctl restart $SERVICE_NAME"
-    echo "  - Test local proxy: $APP_DIR/localproxy --help"
     echo
     echo -e "${YELLOW}Next Steps:${NC}"
     echo "  1. Edit the configuration file: $CONFIG_DIR/relay-config.json"
     echo "  2. Configure AWS IoT Core certificates in: $CONFIG_DIR/certs/"
     echo "     - Place certificate.pem.crt, private.pem.key, and AmazonRootCA1.pem"
     echo "     - Update IOT_ENDPOINT in the ecosystem config"
-    echo "  3. Restart the service: systemctl restart $SERVICE_NAME"
-    echo "  4. Monitor the logs: journalctl -u $SERVICE_NAME -f"
+    echo "  3. Ensure Docker is running: systemctl status docker"
+    echo "  4. Restart the service: systemctl restart $SERVICE_NAME"
+    echo "  5. Monitor the logs: journalctl -u $SERVICE_NAME -f"
     echo
     echo -e "${YELLOW}IoT Sidecar Features:${NC}"
     echo "  - Device Shadow updates for remote config changes"
-    echo "  - Secure tunneling support for remote access"
+    echo "  - Secure tunneling support via Docker container"
     echo "  - Remote command execution (run, stop, restart)"
     echo "  - Status reporting to AWS IoT Core"
     echo
     echo -e "${YELLOW}Note:${NC} Make sure your serial ports, network settings, and IoT certificates"
     echo "are correct in the configuration files before starting operations."
+    echo "Ensure the destination port (default: 22) is open and the target service is running."
     echo
 }
 
@@ -666,15 +543,13 @@ main() {
     
     check_root
     detect_distro
-    install_system_deps
-    install_protobuf
     install_nodejs
+    install_docker
     install_pm2
     create_app_user
     create_directories
     copy_app_files
     install_node_deps
-    install_local_proxy
     create_config
     create_pm2_config
     setup_udev_rules
