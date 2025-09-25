@@ -498,6 +498,7 @@ class IoTSidecar {
    * Start the main relay process
    */
   async startRelayProcess() {
+    const logtopic = `${this.thingName}/logs`;
     if (this.relayProcess) {
       logger.warn('Relay process already running');
       return;
@@ -516,10 +517,12 @@ class IoTSidecar {
       
       this.relayProcess.stdout.on('data', (data) => {
         logger.info('Relay stdout', { output: data.toString() });
+        this.device.publish(logtopic, data.toString());
       });
       
       this.relayProcess.stderr.on('data', (data) => {
         logger.warn('Relay stderr', { output: data.toString() });
+        this.device.publish(logtopic, data.toString());
       });
       
       this.relayProcess.on('close', (code) => {
@@ -532,6 +535,7 @@ class IoTSidecar {
         logger.error('Relay process error', { error: error.message });
         this.relayProcess = null;
         this.updateShadowState({ relayStatus: 'error' });
+        this.device.publish(logtopic, error.message);
       });
       
       logger.info('Relay process started');
@@ -539,6 +543,7 @@ class IoTSidecar {
       
     } catch (error) {
       logger.error('Failed to start relay process', { error: error.message });
+      this.device.publish(logtopic, error.message);
       throw error;
     }
   }
