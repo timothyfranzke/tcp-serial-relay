@@ -121,22 +121,23 @@ class RelayService extends EventEmitter {
    */
   async connectClients() {
     const secondaryType = this.config.connectionType === 'tcp' ? 'secondary TCP' : 'Serial';
-    logger.info(`Connecting to TCP and ${secondaryType} endpoints...`);
+    logger.info(`Connecting to ${secondaryType} and TCP endpoints...`);
 
-    // Connect TCP client
-    updateStatus({ message: 'Connecting to TCP server...' });
-    await this.tcpClient.connect();
-    updateConnection('tcp', { 
-      connected: true, 
-      ...this.tcpClient.getStats() 
-    });
-
-    // Connect Secondary client
+    // Connect Secondary client FIRST to avoid race condition
+    // (TCP server may send data immediately upon connection, before serial is ready)
     updateStatus({ message: `Connecting to ${secondaryType} endpoint...` });
     await this.secondaryClient.connect();
-    updateConnection('secondary', { 
-      connected: true, 
-      ...this.secondaryClient.getStats() 
+    updateConnection('secondary', {
+      connected: true,
+      ...this.secondaryClient.getStats()
+    });
+
+    // Connect TCP client after secondary is ready
+    updateStatus({ message: 'Connecting to TCP server...' });
+    await this.tcpClient.connect();
+    updateConnection('tcp', {
+      connected: true,
+      ...this.tcpClient.getStats()
     });
 
     logger.info('Both connections established successfully');
