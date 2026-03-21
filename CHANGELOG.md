@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Memory leak in long-running services
 - Serial port reconnection edge cases
 
+## [1.2.48] - 2026-03-21
+
+### Fixed
+- **Critical: `finalStats` crash in `stop()` preventing clean shutdown** — `stop()` referenced an undeclared `finalStats` variable, causing a `ReferenceError` that left TCP connections open. On Veeder-Root gas meters (1-2 max connections), this exhausted available slots and blocked subsequent runs.
+- **Connection order race condition** — Secondary client now connects before TCP client. Previously the TCP server could send data before the secondary (meter) side was ready to receive it.
+
+### Added
+- Unit tests for connection lifecycle (28 tests across 4 files):
+  - `tests/unit/tcp-client.test.js` — connect, close, send, error handling, idempotent close
+  - `tests/unit/secondary-tcp-client.test.js` — connect, close, heartbeat, reconnect, socket validation
+  - `tests/unit/serial-client.test.js` — connect, close, send with mocked SerialPort
+  - `tests/unit/relay-service.test.js` — connection order, stop() lifecycle, data relay
+
 ## [1.0.0] - 2024-01-15
 
 ### Added
