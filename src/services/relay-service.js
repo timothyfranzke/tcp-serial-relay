@@ -586,6 +586,7 @@ class RelayService extends EventEmitter {
     }
 
     this.isRunning = false;
+    const finalStats = this.getStats();
     logger.info('Relay service stopped', {
       dataRelayed: this.dataRelayed,
       duration: finalStats.duration,
