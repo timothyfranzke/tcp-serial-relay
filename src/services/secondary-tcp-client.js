@@ -415,17 +415,17 @@ class SecondaryTcpClient extends EventEmitter {
         logger.info('Secondary TCP connection closed');
         resolve();
       });
-      
-      this.socket.end();
-      
-      // Force close after timeout
+
+      // Use destroy() (sends RST) instead of end() (sends FIN).
+      // Veeder-Root meters don't properly release connection slots on FIN,
+      // causing ECONNREFUSED on subsequent runs.
+      this.socket.destroy();
+
+      // Fallback if 'close' event doesn't fire
       setTimeout(() => {
-        if (this.socket && !this.socket.destroyed) {
-          this.socket.destroy();
-        }
         this.cleanup();
         resolve();
-      }, 5000);
+      }, 3000);
     });
   }
 
