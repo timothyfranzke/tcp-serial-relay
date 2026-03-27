@@ -1,11 +1,15 @@
 // src/app.js
 require('dotenv').config();
 
+const fs = require('fs');
+const { execSync } = require('child_process');
 const { logger } = require('./utils/logger');
 const { loadConfig, updateConfig } = require('./config');
 const { shutdown, updateStatus, onShutdown, getStatus, setConfig, setUpdateConfigFunc } = require('./utils/status-manager');
 const { getDeviceInfo } = require('./utils/device-info');
 const RelayService = require('./services/relay-service');
+
+const FAILURE_STATE_FILE = '/tmp/tcp-serial-relay-secondary-failures';
 
 /**
  * Main application class
@@ -47,10 +51,11 @@ class TcpSerialRelayApp {
       await this.startRelayService();
 
     } catch (error) {
-      logger.error('Application startup failed', { 
+      logger.error('Application startup failed', {
         error: error.message,
-        stack: error.stack 
+        stack: error.stack
       });
+      this.recordFailure(error);
       await shutdown(false, `Startup failed: ${error.message}`, 1);
     }
   }
@@ -114,10 +119,11 @@ class TcpSerialRelayApp {
     this.relayService.on('started', () => {
       const connectionMode = this.config.connectionType === 'tcp' ? 'TCP-to-TCP' : 'TCP-to-Serial';
       logger.info(`${connectionMode} relay service started successfully`);
-      updateStatus({ 
+      updateStatus({
         message: 'Relay service running - waiting for data...',
         success: false // Will be true once data is relayed
       });
+      this.clearFailures();
     });
 
     // Data successfully relayed
@@ -184,6 +190,52 @@ class TcpSerialRelayApp {
       logger.info('Application initialization completed successfully');
     } catch (error) {
       throw new Error(`Failed to start relay service: ${error.message}`);
+    }
+  }
+
+  /**
+   * Record a secondary TCP connection failure and reboot if threshold is met.
+   */
+  recordFailure(error) {
+    const secondaryIp = this.config?.secondaryTcpIp;
+    if (!secondaryIp || !error?.message?.includes('ECONNREFUSED') || !error.message.includes(secondaryIp)) {
+      return;
+    }
+
+    let count = 0;
+    try {
+      count = parseInt(fs.readFileSync(FAILURE_STATE_FILE, 'utf8').trim(), 10) || 0;
+    } catch (e) {
+      // File doesn't exist yet, start at 0
+    }
+
+    count++;
+    try {
+      fs.writeFileSync(FAILURE_STATE_FILE, String(count));
+    } catch (e) {
+      logger.error('Failed to write failure state file', { error: e.message });
+    }
+
+    logger.warn(`Secondary TCP ECONNREFUSED failure count: ${count}`, { secondaryIp, count });
+
+    if (count >= 1) {
+      logger.warn('Circuit breaker triggered — rebooting device to free meter TCP slots', { count, secondaryIp });
+      try {
+        execSync('sudo reboot');
+      } catch (e) {
+        logger.error('Reboot command failed', { error: e.message });
+      }
+    }
+  }
+
+  /**
+   * Clear the consecutive failure counter on successful relay start.
+   */
+  clearFailures() {
+    try {
+      fs.writeFileSync(FAILURE_STATE_FILE, '0');
+    } catch (e) {
+      logger.error('Failed to clear failure state file', { error: e.message });
     }
   }
 
